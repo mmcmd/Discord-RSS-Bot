@@ -89,6 +89,7 @@ class Sources:
         self.delay = 0.0
         self.gate: asyncio.Event | None = None
         self.during_fetch: Callable[[str], None] | None = None
+        self.pages: dict[str, str] = {}  # article address -> its HTML
 
     def serve(self, url: str, *items: Item, title: str = "Site", link: str = "") -> None:
         self.listings[url] = ParsedFeed(title=title, link=link, image="", items=tuple(items))
@@ -114,6 +115,8 @@ class Sources:
                 await asyncio.Event().wait()
             if isinstance(step, BaseException):
                 raise step
+            if url in self.pages:
+                return FetchResult(False, self.pages[url].encode(), None, None, url)
             current = self.etags.get(url)
             if current is not None and current == etag:
                 return FetchResult(True, b"", current, self.modified.get(url), url)
@@ -168,10 +171,12 @@ class Renderer:
     def __init__(self, prefix: str = "") -> None:
         self.prefix = prefix
         self.broken: set[str] = set()  # the keys of Items it cannot render
+        self.rendered: list[Item] = []
 
     def __call__(self, feed: Feed, item: Item) -> OutgoingMessage:
         if item.key in self.broken:
             raise ValueError("cannot render this")
+        self.rendered.append(item)
         return OutgoingMessage(content=self.prefix + item.key)
 
 
@@ -653,7 +658,8 @@ async def test_an_item_left_to_retry_makes_the_next_check_read_the_source_in_ful
 
     bench.wait(feed)
     await bench.scheduler.tick()
-    assert bench.sources.fetches[-1] == (feed.url, None, None)
+    feed_fetches = [fetch for fetch in bench.sources.fetches if fetch[0] == feed.url]
+    assert feed_fetches[-1] == (feed.url, None, None)
     assert bench.deliverer.posted == ["a"]
     assert bench.feed(feed).etag == '"v2"'
 
@@ -2214,3 +2220,65 @@ async def test_nothing_secret_is_logged_when_a_fetch_fails(make, caplog):
         if record.name.startswith("rssbot"):
             assert "SECRET" not in formatter.format(record)
     assert "SECRET" not in caplog.text.split("RuntimeError")[0]
+
+
+# -- cover image fallback (docs/adr/0004) --
+
+
+def article(image: str) -> str:
+    return f'<html><head><meta property="og:image" content="{image}"></head><body></body></html>'
+
+
+async def test_an_item_without_an_image_gets_the_og_image_of_its_page(make):
+    bench = make()
+    feed = await bench.started("a", item("old"))
+    new = item("new", link="https://site.example/new")
+    bench.sources.pages[new.link] = article("https://cdn.example/pic.jpg")
+    bench.publish(feed, new)
+    bench.wait(feed)
+    await bench.scheduler.check_feed(feed.id)
+    assert [i.image for i in bench.render.rendered] == ["https://cdn.example/pic.jpg"]
+
+
+async def test_an_item_with_an_image_does_not_fetch_its_page(make):
+    bench = make()
+    feed = await bench.started("a", item("old"))
+    new = item("new", image="https://cdn.example/feed.jpg")
+    bench.publish(feed, new)
+    bench.wait(feed)
+    await bench.scheduler.check_feed(feed.id)
+    assert [i.image for i in bench.render.rendered] == ["https://cdn.example/feed.jpg"]
+    assert bench.sources.fetched(new.link) == 0
+
+
+async def test_a_page_that_cannot_be_read_still_posts_the_item(make):
+    bench = make()
+    feed = await bench.started("a", item("old"))
+    new = item("new")
+    bench.sources.fetch_script[new.link] = FetchError("blocked")
+    bench.publish(feed, new)
+    bench.wait(feed)
+    await bench.scheduler.check_feed(feed.id)
+    assert [i.image for i in bench.render.rendered] == [""]
+
+
+async def test_a_page_that_hangs_is_given_up_on_and_the_item_still_posts(make):
+    bench = make(cover_timeout_s=0.05)
+    feed = await bench.started("a", item("old"))
+    new = item("new")
+    bench.sources.fetch_script[new.link] = HANG
+    bench.publish(feed, new)
+    bench.wait(feed)
+    await bench.scheduler.check_feed(feed.id)
+    assert [i.image for i in bench.render.rendered] == [""]
+
+
+async def test_pages_are_fetched_at_most_ten_at_a_time(make):
+    bench = make()
+    feed = await bench.started("a", item("old"))
+    new = [item(f"n{i}", published=START + i) for i in range(CATCH_UP_LIMIT)]
+    bench.publish(feed, *new)
+    bench.sources.delay = 0.01
+    bench.wait(feed)
+    await bench.scheduler.check_feed(feed.id)
+    assert 1 < bench.sources.peak <= 10

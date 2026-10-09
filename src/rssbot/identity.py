@@ -143,7 +143,8 @@ def _resolve(base: str, href: str) -> str:
     return url if _usable_image(url) else ""
 
 
-def _icon_from_page(body: bytes, page_url: str) -> str:
+def _scan(body: bytes, page_url: str) -> tuple[_HeadScanner, str]:
+    """What the page's <head> holds, and the address its links are relative to."""
     scanner = _HeadScanner()
     try:
         scanner.feed(body[:MAX_PAGE_BYTES].decode("utf-8", errors="replace"))
@@ -155,15 +156,38 @@ def _icon_from_page(body: bytes, page_url: str) -> str:
     if scanner.base:
         with contextlib.suppress(ValueError):
             base = urljoin(page_url, scanner.base)
+    return scanner, base
 
+
+def _og_image(scanner: _HeadScanner, base: str) -> str:
+    for href in scanner.og_images:
+        image = _resolve(base, href)
+        if image:
+            return image
+    return ""
+
+
+def _icon_from_page(body: bytes, page_url: str) -> str:
+    scanner, base = _scan(body, page_url)
     icon = _best(scanner.apple, base) or _best(scanner.icons, base)
     if icon:
         return icon
-    for href in scanner.og_images:
-        icon = _resolve(base, href)
-        if icon:
-            return icon
-    return ""
+    return _og_image(scanner, base)
+
+
+async def article_image(link: str, fetcher: Fetcher) -> str:
+    """The og:image of an Item's page, for an Item whose Feed gave no image.
+
+    Never raises (other than cancellation): a failure only means no image.
+    """
+    try:
+        result = await fetcher.fetch(link)
+        if result.not_modified or not result.body:
+            return ""
+        scanner, base = _scan(result.body, result.url or link)
+        return _og_image(scanner, base)
+    except Exception:  # noqa: BLE001 - FetchError or anything unexpected
+        return ""
 
 
 async def discover(parsed: ParsedFeed, feed_url: str, fetcher: Fetcher) -> SiteIdentity:
