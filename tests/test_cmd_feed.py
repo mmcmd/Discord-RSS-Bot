@@ -101,18 +101,23 @@ class Clock:
         self.t += int(seconds)
 
 
-def item(key: str) -> Item:
+def item(key: str, author: str = "") -> Item:
     return Item(
         key=key,
         title=f"Title {key}",
         link=f"https://example.com/{key}",
         summary=f"Summary {key}",
         content="",
-        author="",
+        author=author,
         published=None,
         categories=(),
         image="",
     )
+
+
+def ref(key: str) -> int:
+    """What stands for that Item in a custom id."""
+    return feed._item_ref(item(key))
 
 
 class Web:
@@ -404,9 +409,16 @@ async def test_a_form_is_refused_for_a_non_manager(env: Env) -> None:
 
 async def test_another_servers_feed_is_refused_on_a_button(env: Env) -> None:
     foreign = await env.add(server_id=OTHER_SERVER)
-    for button in (feed.PauseFeed, feed.RemoveFeed, feed.BackToPanel, feed.PostPreview):
+    buttons = (
+        feed.PauseFeed(foreign.id),
+        feed.RemoveFeed(foreign.id),
+        feed.BackToPanel(foreign.id),
+        feed.PostPreview(foreign.id, ref("a")),
+        feed.PickPreview(foreign.id, ref("a")),
+    )
+    for button in buttons:
         interaction = env.click()
-        await button(foreign.id).callback(interaction)  # type: ignore[arg-type]
+        await button.callback(interaction)  # type: ignore[arg-type]
         assert interaction.text == ui.FEED_GONE
     assert env.feed(foreign.id).paused is None
     assert env.posts.sent == []
@@ -1094,13 +1106,22 @@ async def test_test_previews_privately_without_posting(env: Env) -> None:
     assert f"as it would be posted in <#{TEXT}>" in note["content"]
     assert "Nothing has been posted" in note["content"]
     assert "Forum post title" not in note["content"]
-    assert note["content"].splitlines()[-1] == f"Posting it will mention <@&{ROLE}>."
+    assert note["content"].splitlines() == [
+        f"Above is the newest Item of **Example News** as it would be posted in <#{TEXT}>. "
+        "Nothing has been posted.",
+        "**1. Title a**",
+        "2. Title b",
+        "3. Title c",
+        f"Posting it will mention <@&{ROLE}>.",
+    ]
     assert note["allowed_mentions"] is ui.NO_MENTIONS  # saying so pings nobody
     assert component_ids(note["view"]) == [
-        f"rss:c:feed_post:{found.id}",
+        *(f"rss:c:feed_test_pick:{found.id}:{ref(key)}" for key in "abc"),
+        f"rss:c:feed_post:{found.id}:{ref('a')}",
         f"rss:c:feed_panel:{found.id}",
     ]
-    assert rows(note["view"]) == [["Post to channel", "Back to Feed"]]
+    assert rows(note["view"]) == [["1", "2", "3"], ["Post to channel", "Back to Feed"]]
+    assert [button.item.disabled for button in note["view"].children[:3]] == [True, False, False]
     assert env.posts.sent == []
 
     # Back turns the note into the Feed panel; the preview above is another message.
@@ -1122,7 +1143,7 @@ async def test_test_of_a_forum_feed_says_the_forum_post_title(env: Env) -> None:
     assert "**Forum post title**: Example News: Title a" in interaction.text
     assert "**Post as**: Example News" in interaction.text
     assert "will mention" not in interaction.text  # the Feed has no mention roles
-    assert rows(interaction.last[1]["view"]) == [["Post to channel", "Back to Feed"]]
+    assert rows(interaction.last[1]["view"])[-1] == ["Post to channel", "Back to Feed"]
 
 
 async def test_test_says_so_when_discord_refuses_the_preview(env: Env) -> None:
@@ -1143,17 +1164,152 @@ async def test_test_says_so_when_discord_refuses_the_preview(env: Env) -> None:
     assert env.posts.sent == []
 
 
-async def test_test_notes_when_the_filters_would_hold_the_item_back(env: Env) -> None:
+async def test_test_of_a_feed_with_one_item_has_no_numbers(env: Env) -> None:
+    found = await env.add(URL2)
+    interaction = env.interaction()
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert "Above is the newest Item of **Other Site**" in interaction.text
+    assert "1." not in interaction.text
+    assert rows(interaction.last[1]["view"]) == [["Post to channel", "Back to Feed"]]
+
+
+async def test_a_number_shows_that_item_in_new_messages(env: Env) -> None:
     found = await env.add()
+    interaction = env.click()
+    await feed.PickPreview(found.id, ref("b")).callback(interaction)  # type: ignore[arg-type]
+
+    assert names(interaction) == ["defer", "followup", "followup"]
+    assert interaction.calls[0][1] == {"ephemeral": True, "thinking": True}  # the old note stays
+    preview, note = interaction.calls[1][1], interaction.calls[2][1]
+    assert "**Title b**" in preview["content"]
+    assert note["content"].splitlines() == [
+        f"Above is Item 2 of **Example News** as it would be posted in <#{TEXT}>. "
+        "Nothing has been posted.",
+        "1. Title a",
+        "**2. Title b**",
+        "3. Title c",
+    ]
+    assert [button.item.disabled for button in note["view"].children[:3]] == [False, True, False]
+    assert component_ids(note["view"])[3] == f"rss:c:feed_post:{found.id}:{ref('b')}"
+    assert env.posts.sent == []
+
+
+async def test_a_number_for_an_item_that_is_gone_shows_the_newest_and_says_so(env: Env) -> None:
+    found = await env.add()
+    interaction = env.click()
+    await feed.PickPreview(found.id, ref("gone")).callback(interaction)  # type: ignore[arg-type]
+
+    preview, note = interaction.calls[1][1], interaction.calls[2][1]
+    assert "**Title a**" in preview["content"]
+    assert note["content"].splitlines()[:2] == [
+        "The Item you chose is no longer one the Feed would post.",
+        f"Above is the newest Item of **Example News** as it would be posted in <#{TEXT}>. "
+        "Nothing has been posted.",
+    ]
+
+
+async def test_test_skips_the_items_the_filters_hold_back_and_names_them(env: Env) -> None:
+    found = await env.add()
+    env.web.listings[URL] = ParsedFeed(
+        "Example News",
+        "",
+        "",
+        (item("a", "Sponsored by Acme"), item("b"), item("c", "Sponsored by Zed"), item("d")),
+    )
     await env.service.add_filters(
-        SERVER, found.id, FilterList.BLOCK, FilterField.TITLE, ["Title a"], actor=MEMBER
+        SERVER, found.id, FilterList.BLOCK, FilterField.AUTHOR, ["Sponsored"], actor=MEMBER
     )
     interaction = env.interaction()
     await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
 
     assert names(interaction) == ["defer", "followup", "followup"]
-    assert "Filters would hold this Item back" in interaction.text
-    assert component_ids(interaction.last[1]["view"])[0] == f"rss:c:feed_post:{found.id}"
+    preview, note = interaction.calls[1][1], interaction.calls[2][1]
+    assert "**Title b**" in preview["content"]
+    assert note["content"].splitlines() == [
+        "Above is the newest Item your Filters let through of **Example News** as it would be "
+        f"posted in <#{TEXT}>. Nothing has been posted.",
+        "**1. Title b**",
+        "2. Title d",
+        "Held back by your Filters: *Title a*, *Title c*.",
+    ]
+    assert component_ids(note["view"]) == [
+        f"rss:c:feed_test_pick:{found.id}:{ref('b')}",
+        f"rss:c:feed_test_pick:{found.id}:{ref('d')}",
+        f"rss:c:feed_post:{found.id}:{ref('b')}",
+        f"rss:c:feed_panel:{found.id}",
+    ]
+
+    # A held-back Item cannot be shown by its number either.
+    picked = env.click()
+    await feed.PickPreview(found.id, ref("a")).callback(picked)  # type: ignore[arg-type]
+    assert "**Title b**" in picked.calls[1][1]["content"]
+    assert "no longer one the Feed would post" in picked.text
+
+
+async def test_test_names_five_held_back_items_and_counts_the_rest(env: Env) -> None:
+    found = await env.add()
+    env.web.listings[URL] = ParsedFeed(
+        "Example News", "", "", (*(item(key, "Sponsored") for key in "abcdefg"), item("z"))
+    )
+    await env.service.add_filters(
+        SERVER, found.id, FilterList.BLOCK, FilterField.AUTHOR, ["Sponsored"], actor=MEMBER
+    )
+    interaction = env.interaction()
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert interaction.text.splitlines()[1] == (
+        "Held back by your Filters: *Title a*, *Title b*, *Title c*, *Title d*, *Title e* "
+        "and 2 more."
+    )
+    assert rows(interaction.last[1]["view"]) == [["Post to channel", "Back to Feed"]]
+
+
+async def test_test_when_the_filters_hold_back_every_item(env: Env) -> None:
+    found = await env.add()
+    await env.service.add_filters(
+        SERVER, found.id, FilterList.MUST_HAVE, FilterField.TITLE, ["linux"], actor=MEMBER
+    )
+    interaction = env.interaction()
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert names(interaction) == ["defer", "followup"]  # no preview
+    assert interaction.text.splitlines() == [
+        "Your Filters hold back all 3 Items that **Example News** lists right now, "
+        "so there is nothing to test.",
+        "Held back by your Filters: *Title a*, *Title b*, *Title c*.",
+    ]
+    assert rows(interaction.last[1]["view"]) == [["Back to Feed"]]
+
+
+async def test_post_to_channel_posts_the_chosen_item(env: Env) -> None:
+    found = await env.add()
+    interaction = env.click()
+    await feed.PostPreview(found.id, ref("c")).callback(interaction)  # type: ignore[arg-type]
+
+    ((_, message),) = env.posts.sent
+    assert "**Title c**" in message.content
+    assert interaction.text == f"Posted the Item in <#{TEXT}>."
+    states = env.db.seen_states(found.id, ["a", "c"])
+    assert states["c"][0] is ItemStatus.DELIVERED
+
+
+@pytest.mark.parametrize("key", ["a", "gone"])
+async def test_post_to_channel_never_posts_an_item_the_filters_hold_back(
+    env: Env, key: str
+) -> None:
+    found = await env.add()
+    await env.service.add_filters(
+        SERVER, found.id, FilterList.BLOCK, FilterField.TITLE, ["Title a"], actor=MEMBER
+    )
+    interaction = env.click()
+    await feed.PostPreview(found.id, ref(key)).callback(interaction)  # type: ignore[arg-type]
+
+    assert env.posts.sent == []
+    assert names(interaction) == ["defer", "edit_original_response"]
+    assert interaction.text == feed.POST_GONE
+    assert rows(interaction.last[1]["view"]) == [["Test again", "Back to Feed"]]
+    assert env.db.seen_states(found.id, ["a"])["a"][0] is ItemStatus.SEEN
 
 
 async def test_post_to_channel_records_the_item_so_a_check_does_not_post_it_again(
@@ -1161,11 +1317,11 @@ async def test_post_to_channel_records_the_item_so_a_check_does_not_post_it_agai
 ) -> None:
     found = await env.add()
     env.posts.outcome = DeliveryOutcome.RETRY
-    await feed.PostPreview(found.id).callback(env.click())  # type: ignore[arg-type]
+    await feed.PostPreview(found.id, ref("a")).callback(env.click())  # type: ignore[arg-type]
     assert env.db.seen_states(found.id, ["a"])["a"][0] is ItemStatus.SEEN  # nothing was posted
 
     env.posts.outcome = DeliveryOutcome.DELIVERED
-    await feed.PostPreview(found.id).callback(env.click())  # type: ignore[arg-type]
+    await feed.PostPreview(found.id, ref("a")).callback(env.click())  # type: ignore[arg-type]
     assert env.db.seen_states(found.id, ["a"])["a"][0] is ItemStatus.DELIVERED
 
 
@@ -1181,7 +1337,7 @@ async def test_test_shows_the_services_sentence(env: Env) -> None:
 @pytest.mark.parametrize(
     ("outcome", "words", "again"),
     [
-        (DeliveryOutcome.DELIVERED, f"Posted the newest Item in <#{TEXT}>.", False),
+        (DeliveryOutcome.DELIVERED, f"Posted the Item in <#{TEXT}>.", False),
         (DeliveryOutcome.RETRY, "try again in a minute", True),
         (DeliveryOutcome.UNKNOWN, "cannot tell whether the message was posted", True),
         (DeliveryOutcome.REJECTED, "Discord refused the message", True),
@@ -1195,7 +1351,7 @@ async def test_post_to_channel_reports_each_outcome(
     found = await env.add()
     env.posts.outcome = outcome
     interaction = env.click()
-    await feed.PostPreview(found.id).callback(interaction)  # type: ignore[arg-type]
+    await feed.PostPreview(found.id, ref("a")).callback(interaction)  # type: ignore[arg-type]
 
     ((feed_id, message),) = env.posts.sent
     assert feed_id == found.id and "**Title a**" in message.content
@@ -1205,7 +1361,7 @@ async def test_post_to_channel_reports_each_outcome(
     back = f"rss:c:feed_panel:{found.id}"
     if again:
         assert rows(view) == [["Try again", "Back to Feed"]]
-        assert component_ids(view) == [f"rss:c:feed_post:{found.id}", back]
+        assert component_ids(view) == [f"rss:c:feed_post:{found.id}:{ref('a')}", back]
     else:
         assert rows(view) == [["Back to Feed"]]
         assert component_ids(view) == [back]

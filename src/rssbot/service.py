@@ -83,6 +83,7 @@ MAX_URL_CHARS = 2000
 MAX_FORUM_TITLE_TEMPLATE_CHARS = 200
 MAX_MENTION_ROLES = 10
 MAX_FILTERS = 100
+TEST_CHOICES = 5  # how many Items a test offers to choose from
 MAX_FILTER_WORD_CHARS = 100
 MAX_IMPORT_FEEDS = 100
 IMPORT_CONCURRENCY = 5
@@ -96,6 +97,8 @@ _PAUSE_WORDS = {
     PauseReason.LOST_CHANNEL: "the bot can no longer post in its channel",
     PauseReason.NEEDS_TAG: "the forum requires a tag and the Feed has none",
 }
+
+NO_ITEMS = "The Feed does not list any Items right now."
 
 _LIST_WORDS = {FilterList.MUST_HAVE: "must-have", FilterList.BLOCK: "block"}
 
@@ -122,6 +125,15 @@ class RemovedFeed:
     feed: Feed  # as it was
     channel_id: int
     webhook_in_use: bool  # another Feed in that channel still posts through the webhook
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewListing:
+    """What a test of a Feed can show, newest first."""
+
+    choices: tuple[Item, ...]  # the newest Items its Filters let through, at most TEST_CHOICES
+    held_back: tuple[Item, ...]  # every Item its Filters would stop a Check from posting
+    listed: int  # how many Items the source lists
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,15 +501,41 @@ class FeedService:
             log.warning("Feed %s: the preview could not be rendered", feed.id, exc_info=True)
             raise ServiceError("The newest Item could not be made into a message.") from exc
 
-    def held_back(self, server_id: int, feed_id: int, item: Item) -> bool:
-        """Whether the Feed's Filters would stop a Check from posting this Item."""
+    async def test_listing(self, server_id: int, feed_id: int) -> PreviewListing:
+        """The source's Items a test may show and post, and those the Feed's Filters hold back.
+
+        Changes nothing.
+        """
+        feed = self.get_feed(server_id, feed_id)
+        parsed, _ = await self._read(feed.url)
+        if not parsed.items:
+            raise ServiceError(NO_ITEMS)
+        filters = self._db.list_filters(feed.id)
+        choices: list[Item] = []
+        held_back: list[Item] = []
+        for item in _newest_first(parsed.items):
+            if not self._wanted(feed, item, filters):
+                held_back.append(item)
+            elif len(choices) < TEST_CHOICES:
+                choices.append(item)
+        return PreviewListing(tuple(choices), tuple(held_back), len(parsed.items))
+
+    def render_item(self, server_id: int, feed_id: int, item: Item) -> OutgoingMessage:
+        """One of the source's Items as the Feed would post it now."""
         feed = self.get_feed(server_id, feed_id)
         try:
-            return not passes(item, self._db.list_filters(feed.id))
+            return self._render(feed, item)
+        except Exception as exc:
+            log.warning("Feed %s: an Item could not be rendered", feed.id, exc_info=True)
+            raise ServiceError("That Item could not be made into a message.") from exc
+
+    def _wanted(self, feed: Feed, item: Item, filters: Sequence[Filter]) -> bool:
+        try:
+            return passes(item, filters)
         except Exception:
             # As in a Check: Filters that cannot be applied let the Item through.
             log.warning("Feed %s: could not apply the Filters to an Item", feed.id, exc_info=True)
-            return False
+            return True
 
     async def record_posted(self, server_id: int, feed_id: int, item: Item) -> None:
         """Record an Item posted outside a Check as delivered, so that no Check posts it again."""
@@ -988,11 +1026,8 @@ class FeedService:
     async def _newest(self, feed: Feed) -> Item:
         parsed, _ = await self._read(feed.url)
         if not parsed.items:
-            raise ServiceError("The Feed does not list any Items right now.")
-        dated = [item for item in parsed.items if item.published is not None]
-        if not dated:
-            return parsed.items[0]
-        return max(dated, key=lambda item: item.published or 0)  # the first of equals
+            raise ServiceError(NO_ITEMS)
+        return _newest_first(parsed.items)[0]
 
     async def _discover(self, feed: Feed) -> SiteIdentity:
         """The site's identity. A source that cannot be read is stood in for by what is stored."""
@@ -1023,6 +1058,11 @@ def _post_as_shown(feed: Feed) -> str:
 
 def _picture(feed: Feed) -> str:
     return {PostAs.SITE: feed.site_icon, PostAs.CUSTOM: feed.custom_avatar}.get(feed.post_as, "")
+
+
+def _newest_first(items: Sequence[Item]) -> list[Item]:
+    """By date, the first listed of equals first; Items without a date follow as listed."""
+    return sorted(items, key=lambda item: (item.published is None, -(item.published or 0)))
 
 
 def _filters_detail(did: str, filters: Sequence[Filter]) -> str:

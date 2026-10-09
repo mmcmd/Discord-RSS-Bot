@@ -156,7 +156,7 @@ Replies to the commands below are private: only the person who used the command 
 
 1. **`/setup`** (Admins only). Choose the Logs channel: a text or announcement channel where the bot reports what members do to Feeds and access, and what goes wrong with a Feed (a Broken feed, a Paused feed). This is optional but worth doing, because it is the only place the bot tells you something is wrong. See "Log entries and the Logs channel".
 2. **`/access grant`** (Admins only). The server owner and anyone with Discord's Administrator permission are Admins already, and Admins can do everything a Manager can. To let other people manage Feeds, grant a role or a member the **Manager** level. Grant **Admin** only to people who should also give and take away access. Managers are trusted with the bot's reach, not their own: a Manager can point a Feed at any channel the bot can post in and mention any role the bot may mention, even where that Manager could not post or mention themselves. Grant **Manager** only to people you trust with that (see `docs/adr/0005-managers-act-with-the-bots-reach.md`).
-3. **`/feed add`** (Managers). A form asks for the Feed address (a feed URL; `https://` is added if you leave it off), the channel, how often to check, and who to post as. The bot reads the feed once to make sure it works and then shows the Feed's panel. From the panel, press **Test** to see privately how the newest Item would look, and **Post to channel** to send it for real.
+3. **`/feed add`** (Managers). A form asks for the Feed address (a feed URL; `https://` is added if you leave it off), the channel, how often to check, and who to post as. The bot reads the feed once to make sure it works and then shows the Feed's panel. From the panel, press **Test** to see privately how the newest Item would look, and **Post to channel** to send it for real. Numbered buttons under the preview show the Items before it instead.
 
 Everyone in the server can see the commands in Discord's list; the bot refuses people who have no access with "Only Managers and Admins of this Server can do that." The exception is `/help`, which anyone can use.
 
@@ -179,7 +179,7 @@ A Feed is chosen by name in the `feed` option of a command: start typing and pic
 | `/feed pause feed` | Manager | Stops checking the Feed until it is resumed. |
 | `/feed resume feed` | Manager | Checks a Paused feed again, starting now. |
 | `/feed refresh [feed]` | Manager | Checks the Feed now instead of at its next turn, posts any new Items and says how the Check went. Without `feed`, every Feed of the Server is refreshed, usually within a minute, except Paused feeds and Rate-limited feeds, whose site asked the bot to wait. |
-| `/feed test feed` | Manager | Shows privately what the Feed would post for its newest Item, with a **Post to channel** button. Nothing is posted until you press it. |
+| `/feed test feed` | Manager | Shows privately what the Feed would post for its newest Item, with numbered buttons for the four Items before it and a **Post to channel** button. Nothing is posted until you press it. Items the Feed's Filters hold back are named but cannot be previewed or posted. |
 | `/feed import file [channel]` | Manager | Adds a Feed for every address in an OPML file. See "OPML import and export". |
 | `/feed export` | Manager | Sends the Server's Feeds as an OPML file (`feeds.opml`). |
 | `/template text feed` | Manager | Edits the Feed's message text. |
@@ -319,7 +319,7 @@ Filters decide which Items are posted. There are two lists:
 
 Matching is on whole words and ignores capital letters, so `cat` matches "Cat" but not "category". Chinese, Japanese and Thai are written without spaces, so a word in one of them matches anywhere in the text: `東京` matches "今日は東京で会議". Accents and word endings must match exactly: `cafe` does not match "Café", and `bank` does not match "Banks". Only the text a reader sees is searched, not the addresses of the links in it. A phrase of several words, such as `breaking news`, must appear in that order. Each word can be limited to look in: title and description (the default), title, description, category or author.
 
-Add words with **Add must-have words** or **Add block words**: one word or phrase per line, up to 100 characters each, and up to 100 Filters per Feed. A word cannot be in both lists for the same place to look. Remove one with the menu. A Filter is only applied to Items the Feed finds from then on; an Item that a Filter held back is recorded as seen and is not posted later, even if you change the Filters.
+Add words with **Add must-have words** or **Add block words**: one word or phrase per line, up to 100 characters each, and up to 100 Filters per Feed. A word cannot be in both lists for the same place to look. Remove one with the menu. A Filter is only applied to Items the Feed finds from then on; an Item that a Filter held back is recorded as seen and is not posted later, even if you change the Filters. **Test** never previews or posts an Item that the Filters hold back: it names those Items under the preview, so you can see what a Filter catches.
 
 </details>
 

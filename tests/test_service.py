@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from typing import Any
 
 import pytest
@@ -613,7 +613,8 @@ OPERATIONS: dict[str, Call] = {
     "resume_feed": lambda s, server, feed: s.resume_feed(server, feed, actor=ALEX),
     "preview": lambda s, server, feed: s.preview(server, feed),
     "placeholder_values": lambda s, server, feed: s.placeholder_values(server, feed),
-    "held_back": lambda s, server, feed: s.held_back(server, feed, item("a")),
+    "test_listing": lambda s, server, feed: s.test_listing(server, feed),
+    "render_item": lambda s, server, feed: s.render_item(server, feed, item("a")),
     "record_posted": lambda s, server, feed: s.record_posted(server, feed, item("a")),
     "set_text": lambda s, server, feed: s.set_text(server, feed, "x", actor=ALEX),
     "set_embed": lambda s, server, feed: s.set_embed(server, feed, title="x", actor=ALEX),
@@ -726,16 +727,71 @@ async def test_a_previewed_item_recorded_as_posted_is_not_posted_by_the_next_che
     assert posts.sent == []
 
 
-async def test_held_back_says_whether_the_filters_would_stop_the_item(
-    service: FeedService,
+def keys(items: Iterable[Item]) -> list[str]:
+    return [found.key for found in items]
+
+
+async def test_a_test_listing_offers_the_newest_items_the_filters_let_through(
+    service: FeedService, db: Database, web: Web
 ) -> None:
     feed = await add(service)
-    _, newest = await service.preview(SERVER, feed.id)
-    assert service.held_back(SERVER, feed.id, newest) is False
-    await service.add_filters(
-        SERVER, feed.id, FilterList.BLOCK, FilterField.TITLE, [newest.title], actor=ALEX
+    items = (
+        item("old", 100),
+        item("undated"),
+        item("new", 300),
+        item("tie", 300),
+        item("ad", 400, author="Sponsored by Acme"),
+        *(item(f"m{n}", 200 + n) for n in range(4)),
+        item("ad2", 50, author="Sponsored by Zed"),
     )
-    assert service.held_back(SERVER, feed.id, newest) is True
+    web.listings[URL] = ParsedFeed("Example News", "", "", items)
+    stored = db.get_feed(feed.id)
+
+    listing = await service.test_listing(SERVER, feed.id)
+    assert keys(listing.choices) == ["ad", "new", "tie", "m3", "m2"]
+    assert (listing.held_back, listing.listed) == ((), 10)
+
+    await service.add_filters(
+        SERVER, feed.id, FilterList.BLOCK, FilterField.AUTHOR, ["Sponsored"], actor=ALEX
+    )
+    listing = await service.test_listing(SERVER, feed.id)
+    assert keys(listing.choices) == ["new", "tie", "m3", "m2", "m1"]
+    assert keys(listing.held_back) == ["ad", "ad2"]
+    assert db.get_feed(feed.id) == stored
+    assert db.seen_states(feed.id, ["new", "ad"]) == {}
+
+
+async def test_a_test_listing_looks_as_far_back_as_it_takes(service: FeedService, web: Web) -> None:
+    feed = await add(service)
+    items = (*(item(f"n{n}", 900 - n) for n in range(30)), item("linux", 1, title="Linux 7"))
+    web.listings[URL] = ParsedFeed("Example News", "", "", items)
+    await service.add_filters(
+        SERVER, feed.id, FilterList.MUST_HAVE, FilterField.TITLE, ["linux"], actor=ALEX
+    )
+    listing = await service.test_listing(SERVER, feed.id)
+    assert keys(listing.choices) == ["linux"]
+    assert (len(listing.held_back), listing.listed) == (30, 31)
+    assert listing.held_back[0].key == "n0"  # newest first
+
+    await service.add_filters(
+        SERVER, feed.id, FilterList.BLOCK, FilterField.TITLE, ["7"], actor=ALEX
+    )
+    listing = await service.test_listing(SERVER, feed.id)
+    assert (listing.choices, len(listing.held_back)) == ((), 31)
+
+
+async def test_a_test_listing_errors(service: FeedService, web: Web) -> None:
+    feed = await add(service)
+    web.listings[URL] = listing()
+    assert "does not list any Items" in await error(service.test_listing(SERVER, feed.id))
+    web.errors[URL] = FetchError("The site is down.")
+    assert await error(service.test_listing(SERVER, feed.id)) == "The site is down."
+
+
+async def test_render_item_uses_the_feeds_template(service: FeedService) -> None:
+    feed = await add(service)
+    await service.set_text(SERVER, feed.id, "NEW: {{title}}", actor=ALEX)
+    assert service.render_item(SERVER, feed.id, item("b")).content == "NEW: Title b"
 
 
 async def test_preview_errors(service: FeedService, web: Web) -> None:
@@ -755,6 +811,8 @@ async def test_preview_with_a_renderer_that_breaks(
     service = FeedService(db, web, clock, Journal(db, clock), parse=web.parse, render=broken)
     feed = await add(service)
     assert "could not be made into a message" in await error(service.preview(SERVER, feed.id))
+    with pytest.raises(ServiceError, match="could not be made into a message"):
+        service.render_item(SERVER, feed.id, item("a"))
 
 
 async def test_placeholder_values(service: FeedService, web: Web) -> None:
