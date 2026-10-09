@@ -1,0 +1,21 @@
+services:
+  rssbot:
+    image: ghcr.io/mmcmd/discord-rss-bot:latest
+    build: .
+    env_file: .env
+    volumes:
+      - rssbot-data:/data
+    restart: unless-stopped
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  rssbot-data:

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Example &amp; Co News</title>
+    <link>https://example.com/</link>
+    <description>News from Example</description>
+    <image>
+      <url>https://example.com/logo.png</url>
+      <title>Example</title>
+      <link>https://example.com/</link>
+    </image>
+    <item>
+      <title>First &lt;b&gt;bold&lt;/b&gt; story</title>
+      <link>https://example.com/posts/1</link>
+      <guid isPermaLink="false">post-1</guid>
+      <pubDate>Tue, 02 Jan 2024 03:04:05 GMT</pubDate>
+      <dc:creator>Ann Author</dc:creator>
+      <category>News</category>
+      <category>Tech</category>
+      <category>News</category>
+      <description>&lt;p&gt;Hello &lt;strong&gt;world&lt;/strong&gt; &lt;a href="/more"&gt;more&lt;/a&gt;&lt;/p&gt;&lt;img src="/img/one.png"&gt;</description>
+    </item>
+    <item>
+      <title>Second story</title>
+      <link>https://example.com/posts/2</link>
+      <guid>https://example.com/posts/2</guid>
+      <pubDate>Wed, 03 Jan 2024 10:00:00 +0100</pubDate>
+      <author>bob@example.com (Bob Writer)</author>
+      <description>Plain text summary</description>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Dates</title>
+    <item>
+      <title>rfc822</title>
+      <guid isPermaLink="false">d1</guid>
+      <pubDate>Tue, 02 Jan 2024 03:04:05 GMT</pubDate>
+    </item>
+    <item>
+      <title>iso with offset</title>
+      <guid isPermaLink="false">d2</guid>
+      <pubDate>2024-01-02T05:04:05+02:00</pubDate>
+    </item>
+    <item>
+      <title>garbage</title>
+      <guid isPermaLink="false">d3</guid>
+      <pubDate>the day before yesterday</pubDate>
+    </item>
+    <item>
+      <title>missing</title>
+      <guid isPermaLink="false">d4</guid>
+    </item>
+    <item>
+      <title>updated only</title>
+      <guid isPermaLink="false">d5</guid>
+      <atom:updated>2024-01-02T03:04:05Z</atom:updated>
+    </item>
+    <item>
+      <title>garbage published, good updated</title>
+      <guid isPermaLink="false">d6</guid>
+      <pubDate>32 Foo 2024</pubDate>
+      <atom:updated>2024-01-02T03:04:05Z</atom:updated>
+    </item>
+    <item>
+      <title>year one</title>
+      <guid isPermaLink="false">d7</guid>
+      <pubDate>Mon, 01 Jan 0001 00:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>empty</title>
+      <guid isPermaLink="false">d8</guid>
+      <pubDate></pubDate>
+    </item>
+    <item>
+      <title>date only</title>
+      <guid isPermaLink="false">d9</guid>
+      <dc:date>2024-01-02</dc:date>
+    </item>
+  </channel>
+</rss>

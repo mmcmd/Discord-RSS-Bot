@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+ <link rel="self" href="http://www.youtube.com/feeds/videos.xml?channel_id=UCabcdefghijklmnopqrstuv"/>
+ <id>yt:channel:abcdefghijklmnopqrstuv</id>
+ <yt:channelId>abcdefghijklmnopqrstuv</yt:channelId>
+ <title>Some Channel</title>
+ <link rel="alternate" href="https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv"/>
+ <author>
+  <name>Some Channel</name>
+  <uri>https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv</uri>
+ </author>
+ <published>2015-03-01T10:00:00+00:00</published>
+ <entry>
+  <id>yt:video:dQw4w9WgXcQ</id>
+  <yt:videoId>dQw4w9WgXcQ</yt:videoId>
+  <yt:channelId>abcdefghijklmnopqrstuv</yt:channelId>
+  <title>A video title</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ"/>
+  <author>
+   <name>Some Channel</name>
+   <uri>https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv</uri>
+  </author>
+  <published>2024-03-10T15:00:01+00:00</published>
+  <updated>2024-03-11T09:12:13+00:00</updated>
+  <media:group>
+   <media:title>A video title</media:title>
+   <media:content url="https://www.youtube.com/v/dQw4w9WgXcQ?version=3" type="application/x-shockwave-flash" width="640" height="390"/>
+   <media:thumbnail url="https://i1.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" width="480" height="360"/>
+   <media:description>First line of the description.
+Second line with https://example.com/link</media:description>
+   <media:community>
+    <media:starRating count="10" average="5.00" min="1" max="5"/>
+    <media:statistics views="1234"/>
+   </media:community>
+  </media:group>
+ </entry>
+</feed>

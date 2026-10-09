@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/">
+  <channel>
+    <title>Relative</title>
+    <link>/</link>
+    <image>
+      <url>/static/logo.png</url>
+    </image>
+    <item>
+      <title>Rooted</title>
+      <link>/posts/rooted</link>
+      <guid>42</guid>
+      <media:thumbnail url="thumbs/rooted.jpg"/>
+      <description>&lt;a href="../about"&gt;About&lt;/a&gt;</description>
+    </item>
+    <item>
+      <title>Sibling</title>
+      <link>sibling.html</link>
+      <description>&lt;img src="//cdn.example.com/s.png"&gt;</description>
+    </item>
+  </channel>
+</rss>

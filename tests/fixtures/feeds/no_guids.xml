@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>No guids</title>
+    <link>https://noguid.example.com/</link>
+    <item>
+      <title>Has a link</title>
+      <link>https://noguid.example.com/a</link>
+      <description>Alpha</description>
+    </item>
+    <item>
+      <title>Title and date</title>
+      <pubDate>Mon, 05 Feb 2024 09:00:00 GMT</pubDate>
+      <description>Beta</description>
+    </item>
+    <item>
+      <title>Title and date</title>
+      <pubDate>Tue, 06 Feb 2024 09:00:00 GMT</pubDate>
+      <description>Beta</description>
+    </item>
+    <item>
+      <title>Title and summary</title>
+      <description>Gamma</description>
+    </item>
+    <item>
+      <description>Summary alone</description>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Duplicates</title>
+    <link>https://dup.example.com/</link>
+    <item>
+      <title>Original</title>
+      <guid isPermaLink="false">same</guid>
+    </item>
+    <item>
+      <title>Other</title>
+      <guid isPermaLink="false">other</guid>
+    </item>
+    <item>
+      <title>Repeat</title>
+      <guid isPermaLink="false">same</guid>
+    </item>
+  </channel>
+</rss>
