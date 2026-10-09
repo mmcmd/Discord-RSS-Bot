@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from rssbot.identity import SiteIdentity, discover
+from rssbot.identity import SiteIdentity, article_image, discover
 from rssbot.models import ParsedFeed
 from rssbot.ports import FetchError, FetchResult
 
@@ -267,7 +267,9 @@ async def test_not_modified_result_gives_empty_icon():
     assert got.icon == ""
 
 
-@pytest.mark.parametrize("link, feed_url", [("", "not a url"), ("", ""), ("mailto:a@b.c", "ftp://x/y")])
+@pytest.mark.parametrize(
+    "link, feed_url", [("", "not a url"), ("", ""), ("mailto:a@b.c", "ftp://x/y")]
+)
 async def test_no_usable_url_means_no_fetch(link, feed_url):
     fetcher = FakeFetcher(error=AssertionError("must not fetch"))
     got = await discover(feed(title="T", link=link), feed_url, fetcher)
@@ -305,3 +307,21 @@ async def test_name_empty_when_nothing_known():
 async def test_name_keeps_other_subdomains():
     got = await discover(feed(title="", link="https://blog.example.org/"), FEED_URL, FakeFetcher())
     assert got.name == "blog.example.org"
+
+
+async def test_article_image_is_the_og_image_resolved_against_the_page():
+    fetcher = FakeFetcher(page('<meta property="og:image" content="/img/a.jpg?w=1024">'))
+    assert (
+        await article_image("https://example.com/a", fetcher)
+        == "https://example.com/img/a.jpg?w=1024"
+    )
+
+
+async def test_article_image_ignores_the_icon_links_a_site_identity_would_use():
+    fetcher = FakeFetcher(page('<link rel="apple-touch-icon" href="/touch.png">'))
+    assert await article_image("https://example.com/a", fetcher) == ""
+
+
+async def test_article_image_is_empty_when_the_page_cannot_be_fetched():
+    fetcher = FakeFetcher(error=FetchError("blocked"))
+    assert await article_image("https://example.com/a", fetcher) == ""

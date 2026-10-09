@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import math
 import random
@@ -21,6 +22,7 @@ from typing import Any
 
 from .db import Database, FeedNotFound
 from .filters import passes
+from .identity import article_image
 from .journal import Journal, quote
 from .models import (
     CATCH_UP_LIMIT,
@@ -59,6 +61,8 @@ HOLD_OFF_S = MIN_INTERVAL_S  # before a Check that broke, rather than failed, is
 SLOW_DOWN_MIN_S = 60  # the least a Feed waits after its source asked for fewer requests
 # What one Item's delivery may need: a Cover image download (30 s at most) and the send.
 ITEM_ALLOWANCE_S = 45.0
+COVER_TIMEOUT_S = 5.0  # for the page of an Item the Feed gave no image
+COVER_CONCURRENCY = 10  # pages fetched at once in one Check
 JITTER = 0.1  # every wait is stretched by up to this share of itself
 MAX_ERROR_CHARS = 300
 
@@ -178,6 +182,7 @@ class Scheduler:
         max_concurrent: int = 5,
         check_timeout_s: float = 120.0,  # fetch, parse and every delivery of one Check
         item_allowance_s: float = ITEM_ALLOWANCE_S,  # no Item is started with less left
+        cover_timeout_s: float = COVER_TIMEOUT_S,
         grace_s: float = 5.0,  # for a cancelled Check to stop before it is left behind
         restart_delay_s: float = 5.0,
         rand: Callable[[], float] = random.random,
@@ -194,6 +199,7 @@ class Scheduler:
         self._max_concurrent = max(1, max_concurrent)
         self._check_timeout_s = check_timeout_s
         self._item_allowance_s = item_allowance_s
+        self._cover_timeout_s = cover_timeout_s
         self._grace_s = grace_s
         self._restart_delay_s = restart_delay_s
         self._rand = rand
@@ -424,7 +430,7 @@ class Scheduler:
         if current is None or current.paused is not None or current.url != feed.url:
             return None
         tally = _Tally()
-        queue = self._plan(current, parsed.items, tally)
+        queue = await self._with_covers(self._plan(current, parsed.items, tally))
         pause, unfinished = await self._post(current, queue, deadline, tally)
         return _Outcome(
             current,
@@ -439,6 +445,28 @@ class Scheduler:
             posted=tally.delivered,
             skipped=tally.given_up + tally.beyond,
         )
+
+    async def _with_covers(self, queue: list[Item]) -> list[Item]:
+        """Give each Item the Feed listed no image for the og:image of its own page.
+
+        Only Items about to be posted are looked up, so each page is fetched once. A page
+        that is slow or has no image leaves the Item as it is (docs/adr/0004).
+        """
+        slots = asyncio.Semaphore(COVER_CONCURRENCY)
+
+        async def cover(item: Item) -> Item:
+            if item.image or not item.link:
+                return item
+            async with slots:
+                try:
+                    image = await asyncio.wait_for(
+                        article_image(item.link, self._fetcher), self._cover_timeout_s
+                    )
+                except TimeoutError:
+                    return item
+            return dataclasses.replace(item, image=image) if image else item
+
+        return list(await asyncio.gather(*(cover(item) for item in queue)))
 
     async def _parse_in_thread(self, feed_id: int, body: bytes, url: str) -> ParsedFeed:
         job = asyncio.ensure_future(asyncio.to_thread(self._parse, body, url))
