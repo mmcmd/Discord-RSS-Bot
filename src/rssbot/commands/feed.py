@@ -703,7 +703,7 @@ async def _send_preview(interaction: discord.Interaction, feed: Feed) -> None:
     """Show privately what the Feed would post for the newest Item, then offer to post it."""
     await ui.defer(interaction)
     message, _ = await _service(interaction).preview(feed.server_id, feed.id)
-    embed = build_embed(message.embed)
+    embed = build_embed(message.embed, published=message.published)
     content = message.content or (None if embed is not None else "*(no message text)*")
     await ui.reply(interaction, content, embed=embed, view=build_view(message))
 

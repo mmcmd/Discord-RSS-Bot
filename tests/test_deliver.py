@@ -388,6 +388,24 @@ def test_embed_is_built_from_the_spec() -> None:
     }
 
 
+def test_embed_timestamp_is_the_items_date_unless_switched_off() -> None:
+    on = build_embed(EmbedSpec(title="T", footer="F"), published=1_700_000_000)
+    assert on is not None
+    assert on.timestamp is not None and int(on.timestamp.timestamp()) == 1_700_000_000
+    assert on.timestamp.utcoffset() is not None  # Discord needs the zone to convert it
+
+    off = build_embed(EmbedSpec(title="T", timestamp=False), published=1_700_000_000)
+    assert off is not None and off.timestamp is None
+    undated = build_embed(EmbedSpec(title="T"), published=None)
+    assert undated is not None and undated.timestamp is None
+    impossible = build_embed(EmbedSpec(title="T"), published=10**30)
+    assert impossible is not None and impossible.timestamp is None
+
+
+def test_a_date_alone_is_not_an_embed() -> None:
+    assert build_embed(EmbedSpec(), published=1_700_000_000) is None
+
+
 def test_embed_edge_cases() -> None:
     assert build_embed(None) is None
     assert build_embed(EmbedSpec()) is None

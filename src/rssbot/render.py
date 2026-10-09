@@ -115,6 +115,7 @@ def _build(feed: Feed, item: Item, *, customised: bool) -> OutgoingMessage:
         thread_title=thread_title,
         tag_ids=tag_ids,
         cover_image_url=cover,
+        published=item.published if embed is not None else None,
     )
 
 
@@ -250,6 +251,7 @@ def _embed(spec: EmbedSpec, values: Mapping[str, str], plain: Mapping[str, str])
         footer=footer,
         colour=colour,
         fields=tuple(fields),
+        timestamp=spec.timestamp,
     )
 
 

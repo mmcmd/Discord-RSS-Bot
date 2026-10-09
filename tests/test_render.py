@@ -1130,3 +1130,10 @@ def test_hidden_buttons_names_the_positions_left_out_for_this_item() -> None:
     assert hidden_buttons(feed, make_item()) == ()
     assert hidden_buttons(feed, make_item(image="", author="")) == (2, 3)
     assert hidden_buttons(make_feed(), make_item()) == ()
+
+
+def test_message_carries_the_items_date_and_the_embed_setting() -> None:
+    feed = make_feed(embed=EmbedSpec(title="{{title}}", timestamp=False))
+    message = render_item(feed, make_item(published=1_700_000_000))
+    assert message.published == 1_700_000_000
+    assert message.embed is not None and message.embed.timestamp is False
