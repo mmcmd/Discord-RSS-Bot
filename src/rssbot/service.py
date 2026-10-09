@@ -513,6 +513,7 @@ class FeedService:
         image: str | None = None,
         footer: str | None = None,
         colour: int | str | None = None,
+        timestamp: bool | None = None,
     ) -> Feed:
         """Set parts of the Embed, creating it if needed.
 
@@ -535,6 +536,8 @@ class FeedService:
             changes["footer"] = _template(footer, "The Embed footer", MAX_EMBED_FOOTER)
         if colour is not None:
             changes["colour"] = _colour(colour)
+        if timestamp is not None:
+            changes["timestamp"] = timestamp
         what = "added the Embed" if feed.embed is None else "changed the Embed"
         embed = replace(feed.embed or EmbedSpec(), **changes)
         return self._change_template(actor, feed, what, embed=embed)

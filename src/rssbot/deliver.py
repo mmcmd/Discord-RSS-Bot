@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import io
 import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import discord
@@ -129,8 +131,13 @@ def build_allowed_mentions(role_ids: tuple[int, ...]) -> discord.AllowedMentions
     )
 
 
-def build_embed(spec: EmbedSpec | None, *, fallback_image: str = "") -> discord.Embed | None:
-    """The Embed, or None if there is nothing to show in it."""
+def build_embed(
+    spec: EmbedSpec | None, *, fallback_image: str = "", published: int | None = None
+) -> discord.Embed | None:
+    """The Embed, or None if there is nothing to show in it.
+
+    `published` is shown after the footer, converted by Discord to each viewer's own time.
+    """
     if spec is None:
         return None
     embed = discord.Embed(
@@ -144,6 +151,10 @@ def build_embed(spec: EmbedSpec | None, *, fallback_image: str = "") -> discord.
         embed.set_image(url=image)
     if spec.footer:
         embed.set_footer(text=spec.footer)
+    if spec.timestamp and published is not None:
+        # An impossible date is left out, as {{date}} is.
+        with contextlib.suppress(OverflowError, OSError, ValueError):
+            embed.timestamp = datetime.fromtimestamp(published, UTC)
     for field in spec.fields:
         embed.add_field(name=field.name, value=field.value, inline=field.inline)
     if not (embed.title or embed.description or image or spec.footer or spec.fields):
@@ -187,7 +198,9 @@ class _Target:
 def _build_parts(message: OutgoingMessage, *, fallback_image: str = "") -> _Parts:
     return _Parts(
         content=message.content,
-        embed=build_embed(message.embed, fallback_image=fallback_image),
+        embed=build_embed(
+            message.embed, fallback_image=fallback_image, published=message.published
+        ),
         view=build_view(message),
         allowed_mentions=build_allowed_mentions(message.mention_role_ids),
     )

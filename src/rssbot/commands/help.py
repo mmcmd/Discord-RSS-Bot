@@ -136,7 +136,9 @@ CATEGORIES = (
                 "template embed",
                 "Edits the Embed posted under the message text: its title, description, link, "
                 "image and footer. `colour` is a hex code or `none`; leave it out to keep the "
-                "colour.",
+                "colour. "
+                "After saving, a button switches on or off the post date shown after the "
+                "footer in each reader's own time.",
                 "<feed> [colour]",
                 "/template embed feed:Ars Technica colour:#ff8800",
             ),

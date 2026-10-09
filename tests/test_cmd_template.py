@@ -126,6 +126,10 @@ def make_feed(db: Database, server_id: int = SERVER, **kwargs: Any) -> Feed:
     )
 
 
+def button_labels(view: discord.ui.View) -> list[str]:
+    return [b["label"] for b in view.to_components()[1]["components"]]
+
+
 def labels(view: discord.ui.View) -> list[str]:
     return [child.item.label for child in view.children]  # type: ignore[attr-defined]
 
@@ -261,6 +265,7 @@ def test_every_action_and_form_is_prefixed() -> None:
         "tpl_text",
         "tpl_embed",
         "tpl_colour",
+        "tpl_embed_time",
         "tpl_embed_remove",
         "tpl_embed_remove_yes",
         "tpl_embed_keep",
@@ -325,6 +330,7 @@ async def test_openers_recheck_access_and_the_server(
         template.RemoveButton,
         template.ColourSelect,
         template.RemoveEmbed,
+        template.ToggleTimestamp,
         template.RemoveEmbedConfirmed,
         template.KeepEmbed,
         template.ResetTemplate,
@@ -699,6 +705,7 @@ async def test_saving_the_embed_keeps_changes_or_clears_the_colour(
         f"rss:c:tpl_colour:{feed.id}",
         f"rss:c:tpl_embed:{feed.id}:0",
         f"rss:c:tpl_fields:{feed.id}",
+        f"rss:c:tpl_embed_time:{feed.id}",
         f"rss:c:tpl_embed_remove:{feed.id}",
         f"rss:c:tpl_back:{feed.id}",
     ]
@@ -706,6 +713,7 @@ async def test_saving_the_embed_keeps_changes_or_clears_the_colour(
     assert [b["label"] for b in row["components"]] == [
         "Edit again",
         "Fields",
+        "Append post date to footer (local time): on",
         "Remove Embed",
         "Back to Feed",
     ]
@@ -850,6 +858,24 @@ async def test_colour_select_does_not_make_an_embed(
     assert "has no Embed" in interaction.text
 
 
+async def test_timestamp_button_flips_the_post_date_and_says_so(
+    db: Database, service: FeedService
+) -> None:
+    feed = make_feed(db, embed=EmbedSpec(title="T"))
+    assert stored(db, feed).embed.timestamp is True  # on by default
+
+    off = manager(db, service, type=COMPONENT)
+    await click(off, template.ToggleTimestamp(feed.id))
+    assert stored(db, feed).embed.timestamp is False
+    assert "no longer shows the post date" in off.text
+    assert "Append post date to footer (local time): off" in button_labels(off.last[1]["view"])
+
+    on = manager(db, service, type=COMPONENT)
+    await click(on, template.ToggleTimestamp(feed.id))
+    assert stored(db, feed).embed.timestamp is True
+    assert "Append post date to footer (local time): on" in button_labels(on.last[1]["view"])
+
+
 async def test_remove_embed_asks_in_place_then_removes(db: Database, service: FeedService) -> None:
     fields = (FieldSpec("a", "b"), FieldSpec("c", "d"))
     feed = make_feed(db, embed=EmbedSpec(title="T", fields=fields))
@@ -904,12 +930,14 @@ async def test_cancelling_the_removal_returns_to_the_embed_screen(
         f"rss:c:tpl_colour:{feed.id}",
         f"rss:c:tpl_embed:{feed.id}:0",
         f"rss:c:tpl_fields:{feed.id}",
+        f"rss:c:tpl_embed_time:{feed.id}",
         f"rss:c:tpl_embed_remove:{feed.id}",
         f"rss:c:tpl_back:{feed.id}",
     ]
     assert [b["label"] for b in sent["view"].to_components()[1]["components"]] == [
         "Edit again",
         "Fields",
+        "Append post date to footer (local time): on",
         "Remove Embed",
         "Back to Feed",
     ]

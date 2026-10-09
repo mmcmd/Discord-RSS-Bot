@@ -116,6 +116,7 @@ class EmbedSpec:
     footer: str = ""
     colour: int | None = None
     fields: tuple[FieldSpec, ...] = ()
+    timestamp: bool = True  # show the Item's date after the footer, in each viewer's own time
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +214,7 @@ class OutgoingMessage:
     thread_title: str | None = None  # set when the Feed is bound to a forum channel
     tag_ids: tuple[int, ...] = ()
     cover_image_url: str | None = None  # to download and attach to a Forum post
+    published: int | None = None  # the Item's date, for the Embed's timestamp
 
 
 @dataclass(frozen=True, slots=True)

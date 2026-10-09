@@ -208,7 +208,7 @@ async def _result(
         await _show(
             interaction,
             head + ui.cut(message.content, ui.MESSAGE_LIMIT - len(head)),
-            embed=build_embed(message.embed),
+            embed=build_embed(message.embed, published=message.published),
             view=ui.view_of(*controls(), *link_buttons),
         )
     except discord.HTTPException:
@@ -336,6 +336,7 @@ def _embed_controls(interaction: discord.Interaction, feed_id: int) -> Controls:
             ColourSelect(feed_id, current=embed.colour, chosen=True),
             EditEmbed(feed_id, KEEP_COLOUR, label="Edit again"),
             OpenFields(feed_id),
+            ToggleTimestamp(feed_id, label=_timestamp_label(embed.timestamp)),
             RemoveEmbed(feed_id),
             BackToFeed(feed_id),
         ]
@@ -493,6 +494,27 @@ class ColourSelect(ui.ActionSelect, action="tpl_colour", ids=1, requires=Level.M
         await _service(interaction).set_embed(
             feed.server_id, feed.id, colour=colour, actor=ui.actor_of(interaction)
         )
+        await _result(interaction, feed.id, headline, _embed_controls(interaction, feed.id))
+
+
+def _timestamp_label(on: bool) -> str:
+    return f"Append post date to footer (local time): {'on' if on else 'off'}"
+
+
+class ToggleTimestamp(ui.ActionButton, action="tpl_embed_time", ids=1, requires=Level.MANAGER):
+    label = _timestamp_label(True)
+
+    async def handle(self, interaction: discord.Interaction) -> None:
+        feed = ui.feed_of(interaction, self.ids[0])
+        if feed.embed is None:
+            raise ui.UserError("This Feed has no Embed.")
+        on = not feed.embed.timestamp
+        await ui.defer(interaction, update=True)
+        await _service(interaction).set_embed(
+            feed.server_id, feed.id, timestamp=on, actor=ui.actor_of(interaction)
+        )
+        state = "now shows" if on else "no longer shows"
+        headline = f"The Embed of {_name(feed)} {state} the post date after the footer."
         await _result(interaction, feed.id, headline, _embed_controls(interaction, feed.id))
 
 
