@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Blog</title>
+    <link>https://blog.example.com</link>
+    <item>
+      <title>Both texts</title>
+      <link>https://blog.example.com/both</link>
+      <guid isPermaLink="false">both</guid>
+      <description>The teaser.</description>
+      <content:encoded><![CDATA[<h2>Heading</h2><p>The <i>full</i> article.</p><p><img src="/media/full.png" alt=""></p>]]></content:encoded>
+    </item>
+    <item>
+      <title>Content only</title>
+      <link>https://blog.example.com/content-only</link>
+      <guid isPermaLink="false">content-only</guid>
+      <content:encoded><![CDATA[<p>Just the body.</p>]]></content:encoded>
+    </item>
+    <item>
+      <title>Identical</title>
+      <link>https://blog.example.com/identical</link>
+      <guid isPermaLink="false">identical</guid>
+      <description><![CDATA[<p>Same text.</p>]]></description>
+      <content:encoded><![CDATA[<p>Same text.</p>]]></content:encoded>
+    </item>
+  </channel>
+</rss>

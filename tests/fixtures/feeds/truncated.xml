@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Cut short</title>
+    <link>https://cut.example.com/</link>
+    <item>
+      <title>Whole one</title>
+      <link>https://cut.example.com/1</link>
+      <guid isPermaLink="false">c1</guid>
+      <description>Complete</description>
+    </item>
+    <item>
+      <title>Whole two</title>
+      <link>https://cut.example.com/2</link>
+      <guid isPermaLink="false">c2</guid>
+    </item>
+    <item>
+      <guid isPermaLink="false">c3</guid>
+      <link>https://cut.example.com/3</link>
+      <title>Half an it

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"
+     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>Media</title>
+    <link>https://media.example.com/</link>
+    <itunes:image href="https://media.example.com/cover.jpg"/>
+    <item>
+      <title>media content with type</title>
+      <guid isPermaLink="false">m1</guid>
+      <media:content url="https://media.example.com/clip.mp4" type="video/mp4"/>
+      <media:content url="https://media.example.com/photo" type="image/jpeg"/>
+      <media:thumbnail url="https://media.example.com/thumb1.jpg"/>
+      <description>&lt;img src="https://media.example.com/inline.png"&gt;</description>
+    </item>
+    <item>
+      <title>media content by extension</title>
+      <guid isPermaLink="false">m2</guid>
+      <media:content url="/pics/large.PNG?w=800"/>
+    </item>
+    <item>
+      <title>thumbnail only</title>
+      <guid isPermaLink="false">m3</guid>
+      <media:content url="https://media.example.com/clip.mp4" medium="video"/>
+      <media:thumbnail url="https://media.example.com/t/abc123" width="120" height="90"/>
+      <enclosure url="https://media.example.com/enc.png" type="image/png" length="10"/>
+    </item>
+    <item>
+      <title>image enclosure</title>
+      <guid isPermaLink="false">m4</guid>
+      <enclosure url="https://media.example.com/audio.mp3" type="audio/mpeg" length="10"/>
+      <enclosure url="https://media.example.com/enc.webp" type="image/webp" length="10"/>
+      <itunes:image href="https://media.example.com/episode.jpg"/>
+    </item>
+    <item>
+      <title>itunes image</title>
+      <guid isPermaLink="false">m5</guid>
+      <enclosure url="https://media.example.com/audio.mp3" type="audio/mpeg" length="10"/>
+      <itunes:image href="https://media.example.com/episode.jpg"/>
+      <description>&lt;img src="https://media.example.com/inline.png"&gt;</description>
+    </item>
+    <item>
+      <title>inline image</title>
+      <guid isPermaLink="false">m6</guid>
+      <description>&lt;p&gt;x&lt;/p&gt;&lt;img src="https://media.example.com/inline.png"&gt;</description>
+    </item>
+    <item>
+      <title>unusable schemes</title>
+      <guid isPermaLink="false">m7</guid>
+      <media:thumbnail url="data:image/png;base64,AAAA"/>
+      <enclosure url="ftp://media.example.com/enc.png" type="image/png" length="10"/>
+    </item>
+    <item>
+      <title>no image</title>
+      <guid isPermaLink="false">m8</guid>
+      <enclosure url="https://media.example.com/audio.mp3" type="audio/mpeg" length="10"/>
+      <description>No picture here</description>
+    </item>
+  </channel>
+</rss>

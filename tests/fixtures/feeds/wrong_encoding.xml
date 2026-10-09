@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="us-ascii"?>
+<rss version="2.0">
+  <channel>
+    <title>Café Zürich</title>
+    <link>https://enc.example.com/</link>
+    <item>
+      <title>Crème brûlée — naïve</title>
+      <link>https://enc.example.com/1</link>
+      <description>日本語 and “quotes”</description>
+    </item>
+  </channel>
+</rss>

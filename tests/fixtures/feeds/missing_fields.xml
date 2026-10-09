@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Missing things</title>
+    <item>
+      <link>https://missing.example.com/untitled</link>
+      <description>No title here</description>
+    </item>
+    <item>
+      <title>No link here</title>
+      <guid isPermaLink="false">nolink</guid>
+    </item>
+    <item>
+    </item>
+    <item>
+      <title>   </title>
+      <description></description>
+    </item>
+    <item>
+      <title>Odd link</title>
+      <link>javascript:alert(1)</link>
+      <guid isPermaLink="false">oddlink</guid>
+    </item>
+    <item>
+      <title>Last one</title>
+      <link>https://missing.example.com/last</link>
+    </item>
+  </channel>
+</rss>

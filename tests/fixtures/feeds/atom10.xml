@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title type="text">Atom Example</title>
+  <subtitle>A subtitle</subtitle>
+  <link rel="self" href="https://atom.example.org/feed.atom"/>
+  <link rel="alternate" type="text/html" href="https://atom.example.org/"/>
+  <icon>https://atom.example.org/favicon.ico</icon>
+  <logo>https://atom.example.org/logo.png</logo>
+  <id>urn:uuid:60a76c80-d399-11d9-b93C-0003939e0af6</id>
+  <updated>2024-02-01T12:00:00Z</updated>
+  <entry>
+    <title type="html">Atom &lt;em&gt;one&lt;/em&gt;</title>
+    <link rel="alternate" href="https://atom.example.org/one"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+    <published>2024-01-30T08:00:00Z</published>
+    <updated>2024-02-01T12:00:00Z</updated>
+    <author><name>Carla</name><email>carla@example.org</email></author>
+    <category term="python"/>
+    <category term="rss" label="RSS"/>
+    <summary>Short summary</summary>
+    <content type="xhtml">
+      <div xmlns="http://www.w3.org/1999/xhtml"><p>Full <b>content</b> here.</p><img src="https://atom.example.org/pic.jpg"/></div>
+    </content>
+  </entry>
+  <entry>
+    <title type="text">Generics: List&lt;String&gt; explained</title>
+    <link href="https://atom.example.org/two"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6b</id>
+    <updated>2024-01-15T00:00:00Z</updated>
+    <content type="html">&lt;p&gt;Only content&lt;/p&gt;</content>
+  </entry>
+</feed>
