@@ -710,19 +710,35 @@ def test_channels_with_unused_webhook_are_those_without_a_feed(db: Database) -> 
     assert db.channels_with_unused_webhook() == [10, 20, 30]
 
 
-def test_purging_a_server_also_drops_webhooks_of_channels_with_no_feed(db: Database) -> None:
+def test_purging_a_server_keeps_webhooks_it_cannot_attribute_to_it(db: Database) -> None:
     gone = make_feed(db, server_id=1, channel_id=10)
     live = make_feed(db, server_id=2, channel_id=20)
     db.set_webhook(gone.channel_id, 1, "a")
     db.set_webhook(live.channel_id, 2, "b")
-    db.set_webhook(99, 3, "orphan")  # its Feed was removed earlier
+    # Rows of channels with no Feed: a webhook table row names no Server, so these may belong
+    # to a Server that is still present, whose failed delete the periodic cleanup retries.
+    db.set_webhook(99, 3, "pending")
     db.mark_server_removed(1, 50)
 
     assert db.purge_removed_servers(before=100) == [1]
 
     assert db.get_webhook(10) is None
-    assert db.get_webhook(99) is None
     assert db.get_webhook(20) == (2, "b")
+    assert db.get_webhook(99) == (3, "pending")
+    assert db.channels_with_unused_webhook() == [99]
+
+
+def test_purging_a_server_keeps_the_pending_webhook_of_a_present_server(db: Database) -> None:
+    removed = make_feed(db, server_id=1, channel_id=10)
+    other = make_feed(db, server_id=2, channel_id=20)
+    db.set_webhook(other.channel_id, 222, "tok")
+    db.delete_feed(other.id)  # its Discord delete failed, so the row waits for a retry
+    db.mark_server_removed(removed.server_id, 50)
+
+    db.purge_removed_servers(before=100)
+
+    assert db.channels_with_unused_webhook() == [20]
+    assert db.get_server(2) is not None
 
 
 # -- Webhooks --

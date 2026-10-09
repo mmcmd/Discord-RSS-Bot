@@ -50,6 +50,7 @@ FORUM = 72
 VOICE = 73
 THREAD = 74
 LOCKED = 75
+DELETED = 76  # a channel the Server no longer has
 URL = "https://example.com/feed.xml"
 URL2 = "https://other.example/rss"
 URL3 = "https://example.com/third"
@@ -691,6 +692,54 @@ async def test_settings_opens_a_prefilled_form_keeping_an_unlisted_interval(env:
     options = fields["interval"]["options"]
     assert len(options) == 10
     assert [(o["value"], o["label"]) for o in options if o["default"]] == [("5400", "90 minutes")]
+
+
+async def test_settings_leaves_the_channel_optional_when_it_cannot_be_shown(env: Env) -> None:
+    # Not in the cache is not deleted: an archived thread is dropped from it too. Discord may
+    # refuse an unknown default, so none is sent and the channel need not be picked to save.
+    gone = await env.add(url=URL2, channel_id=DELETED)
+    interaction = env.click(channels=channels())
+    await feed.SettingsButton(gone.id).callback(interaction)  # type: ignore[arg-type]
+    field = form_fields(interaction)["channel"]
+    assert not field.get("default_values")
+    assert field["required"] is False
+
+    kept = await env.add(channel_id=TEXT)
+    interaction = env.click(channels=channels())
+    await feed.SettingsButton(kept.id).callback(interaction)  # type: ignore[arg-type]
+    field = form_fields(interaction)["channel"]
+    assert field["default_values"] == [{"id": TEXT, "type": "channel"}]
+    assert field["required"] is True
+
+
+async def test_settings_without_a_channel_pick_keeps_the_channel(env: Env) -> None:
+    gone = await env.add(url=URL2, channel_id=DELETED)
+    data = edit_form(gone, TEXT, name="Renamed")
+    # Discord sends an optional select left alone as an empty list.
+    (picked,) = [c for c in data["components"] if c["component"]["custom_id"] == "channel"]
+    picked["component"]["values"] = []
+    data["resolved"] = {}
+    interaction = await submit(env, data, channels=channels())
+
+    changed = env.feed(gone.id)
+    assert (changed.name, changed.channel_id) == ("Renamed", DELETED)
+    assert "**Feed**: Renamed" in interaction.text
+    assert env.posts.cleaned == []
+
+    data = edit_form(gone, TEXT, name="Again")
+    data["components"] = [c for c in data["components"] if c["component"]["custom_id"] != "channel"]
+    await submit(env, data, channels=channels())  # the component missing altogether
+    changed = env.feed(gone.id)
+    assert (changed.name, changed.channel_id) == ("Again", DELETED)
+
+
+async def test_settings_with_a_channel_pick_moves_a_feed_whose_channel_was_not_shown(
+    env: Env,
+) -> None:
+    gone = await env.add(url=URL2, channel_id=DELETED)
+    await submit(env, edit_form(gone, TEXT, name="Moved"), channels=channels())
+    changed = env.feed(gone.id)
+    assert (changed.name, changed.channel_id) == ("Moved", TEXT)
 
 
 async def test_edit_rejects_an_option_that_is_not_a_feed(env: Env) -> None:
@@ -1354,7 +1403,7 @@ async def test_panel_names_the_permission_the_bot_lacks(env: Env) -> None:
     in_thread = await env.add(channel_id=THREAD)
     shown = env.interaction(channels=(plain, thread))
     await feed.open_panel(shown, in_thread.id)  # type: ignore[arg-type]
-    assert "lacks the Send Messages in Threads permission" in shown.text.splitlines()[-1]
+    assert shown.text.splitlines()[-1] == warning(THREAD)
 
     found = await env.add(url=URL2, channel_id=TEXT)
     quiet = env.interaction(channels=(plain, thread))
@@ -1365,6 +1414,17 @@ async def test_panel_names_the_permission_the_bot_lacks(env: Env) -> None:
     loud = env.interaction(channels=(plain, thread))
     await feed.open_panel(loud, found.id)  # type: ignore[arg-type]
     assert "lacks the Embed Links permission" in loud.text.splitlines()[-1]
+
+
+async def test_panel_of_a_feed_in_a_thread_of_a_channel_without_send_messages(env: Env) -> None:
+    # The parent denies Send Messages but allows Send Messages in Threads: the bot can post.
+    thread = FakeChannel(
+        THREAD, "a-thread", discord.ChannelType.public_thread, lacking=("send_messages",)
+    )
+    in_thread = await env.add(channel_id=THREAD)
+    interaction = env.interaction(channels=(thread,))
+    await feed.open_panel(interaction, in_thread.id)  # type: ignore[arg-type]
+    assert "**Warning**" not in interaction.text
 
 
 async def test_panel_of_a_feed_in_a_forum(env: Env) -> None:

@@ -25,6 +25,7 @@ import pytest
 from fakes_discord import FakeInteraction
 
 from rssbot import logembed
+from rssbot import parse as parse_module
 from rssbot.commands import _ui as ui
 from rssbot.commands import access as access_commands
 from rssbot.commands import feed as feed_commands
@@ -213,6 +214,48 @@ def test_many_attributes_do_not_make_parsing_quadratic() -> None:
 
     # About 3.7 s today, and four times that for each doubling: a 5 MB body is ~40 minutes.
     assert elapsed < 1.5, f"165 kB of attributes took {elapsed:.1f} s to parse"
+
+
+# A ">" is legal inside a quoted attribute value, and the XML parser reads past it: a guard that
+# ends the tag at the first ">" never sees the attributes after it. Same cost, same thread.
+@pytest.mark.parametrize(
+    "value", ['">"', "'>'", "'\">'", '"\'>"'], ids=["double", "single", "mixed-a", "mixed-b"]
+)
+@pytest.mark.parametrize("where", ["item", "channel", "feed"])
+def test_many_attributes_hidden_behind_a_closing_bracket_do_not_make_parsing_quadratic(
+    value: str, where: str
+) -> None:
+    attributes = " ".join(f"a{n}={value}" for n in range(16_000))
+    opening = {
+        "item": f"<rss><channel><title>t</title><item {attributes}>",
+        "channel": f"<rss><channel {attributes}><title>t</title><item>",
+        "feed": f'<rss version="2.0" {attributes}><channel><title>t</title><item>',
+    }[where]
+    body = (opening + "<guid>1</guid></item></channel></rss>").encode()
+
+    started = time.perf_counter()
+    with contextlib.suppress(Exception):  # refusing such a body is a fine fix
+        parse_feed(body, URL)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.5, f"{len(body) // 1000} kB of attributes took {elapsed:.1f} s to parse"
+
+
+# The hostile-shape scan runs on every body of up to 5 MB, so it must stay linear on bodies built
+# to make a scanner rescan: quotes that never close, and tags that never end.
+@pytest.mark.parametrize(
+    "unit",
+    [b"<a b='", b'<a b="x" c=\'', b"<", b"<a=", b"<a b=>", b"<a b='>' c=\">\"/>", b"<![CDATA["],
+)
+def test_the_hostile_shape_scan_is_linear_on_adversarial_bodies(unit: bytes) -> None:
+    body = unit * (5_000_000 // len(unit))
+
+    started = time.perf_counter()
+    with contextlib.suppress(ParseError):
+        parse_module._refuse_hostile(body, {})
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 2.0, f"scanning 5 MB of {unit!r} took {elapsed:.1f} s"
 
 
 def _nested_tags() -> bytes:
@@ -540,3 +583,42 @@ def test_external_xml_entities_in_a_feed_are_not_fetched() -> None:
     # Bodies that declare entities are refused outright, so nothing can be fetched or expanded.
     with pytest.raises(ParseError):
         parse_feed(body, URL)
+
+
+# The guard must read the body the way feedparser will, charset from the Content-Type header
+# included: a feed that declares its encoding only there is garbage to a guard that ignores it.
+def _hidden_in_attributes() -> str:
+    attributes = " ".join(f'a{n}="1"' for n in range(48_000))
+    return (
+        f"<rss version='2.0'><channel><title>t</title><item {attributes}>"
+        "<guid>1</guid></item></channel></rss>"
+    )
+
+
+def _hidden_in_nesting() -> str:
+    return "<rss version='2.0'><channel><title>t</title>" + "<a>" * 1_000_000
+
+
+def _hidden_in_an_entity() -> str:
+    return (
+        '<!DOCTYPE r [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;">]>'
+        "<rss version='2.0'><channel><title>&b;</title></channel></rss>"
+    )
+
+
+@pytest.mark.parametrize("encoding", ["cp037", "utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize(
+    "make_text", [_hidden_in_attributes, _hidden_in_nesting, _hidden_in_an_entity]
+)
+def test_a_hostile_body_in_an_encoding_given_only_by_the_header_is_refused_quickly(
+    encoding: str, make_text: Any
+) -> None:
+    body = make_text().encode(encoding)
+
+    started = time.perf_counter()
+    with pytest.raises(ParseError):
+        parse_feed(body, URL, f"application/rss+xml; charset={encoding}")
+    elapsed = time.perf_counter() - started
+
+    # Without the fix: 29 s for the attributes, 10 s and 500 MB for the nesting.
+    assert elapsed < 1.0, f"refusing {len(body) // 1000} kB took {elapsed:.1f} s"

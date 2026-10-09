@@ -10,6 +10,7 @@ import calendar
 import contextlib
 import hashlib
 import io
+import re
 from collections.abc import Iterator, Mapping
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -55,9 +56,12 @@ def parse_feed(body: bytes, url: str = "", content_type: str = "") -> ParsedFeed
 
 
 MAX_ITEMS = 500  # per listing; a source listing more is cut to the newest ones
-_MAX_TAG_BYTES = 16 * 1024
+_MAX_TAG_ATTRIBUTES = 1_000  # measured: 8 000 take 0.8 s to parse, and each doubling costs 4x
 _MAX_DEPTH = 10_000  # measured: about 430 bytes of parser memory per level
 _TOO_STRANGE = "That feed is built in a way this bot refuses to read."
+# A start or end tag as the XML parser reads it: a ">" inside a quoted value does not end it.
+# Possessive, so that a body built to make a scanner back up is still read in one pass.
+_TAG = re.compile(rb"""<[^>=]*+(?:=[ \t\r\n]*+(?:"[^"]*+"|'[^']*+'|(?!["']))[^>=]*+)*+>""")
 
 
 class _RootReached(Exception):
@@ -73,25 +77,31 @@ def _stop_at_root(*element: object) -> None:
 
 
 def _refuse_entities(data: bytes) -> None:
-    """Refuse a document whose DOCTYPE declares an entity, as the XML parser reads it."""
+    """Refuse a document whose DOCTYPE declares an entity or attribute defaults, as the XML
+    parser reads it."""
     parser = expat.ParserCreate()
     parser.EntityDeclHandler = _refuse_entity
+    # Attribute defaults are given to every such tag: thousands of them parse like thousands
+    # of attributes, in quadratic time.
+    parser.AttlistDeclHandler = _refuse_entity
     parser.StartElementHandler = _stop_at_root
     # Text that only looks like a declaration, e.g. quoted in an Item, is not one.
     with contextlib.suppress(_RootReached, expat.ExpatError):
         parser.Parse(data, True)
 
 
-def _refuse_hostile(body: bytes) -> None:
+def _refuse_hostile(body: bytes, headers: dict[str, str]) -> None:
     """Refuse the few shapes that make the XML parser use huge time or memory.
 
     Entity declarations expand to a hundred times their size, one tag with thousands of
     attributes parses in quadratic time, and very deep nesting costs memory per level. No
-    real feed needs any of them. Checked before the parser sees the body.
+    real feed needs any of them. Checked before the parser sees the body, which `headers` are
+    the response headers of.
     """
-    # feedparser's own first step, so that the checks read what the parser will read: in
-    # UTF-16 every other byte is a NUL, and nothing below would recognise a tag.
-    data = convert_to_utf8({}, body, {})
+    # feedparser's own first step, with its own headers, so that the checks read what the
+    # parser will read: in UTF-16, or in a charset only the Content-Type names, nothing below
+    # would recognise a tag.
+    data = convert_to_utf8(headers, body, {})
     # feedparser rewrites the DOCTYPE before parsing and keeps the entities it thinks safe.
     # Its rewrite can be steered, so the document is refused before and after it.
     _refuse_entities(data)
@@ -103,23 +113,35 @@ def _refuse_hostile(body: bytes) -> None:
     # Unclosed tags count as nesting, as they do for the parser: it keeps something for
     # every tag that is still open, even an HTML <br> written raw inside a description.
     depth = 0
+    loose = False  # a quote never closed: only the loose parser reads this, and ends a tag at ">"
     at = data.find(b"<")
     while at != -1:
         if data.startswith(b"<!--", at):
             end = data.find(b"-->", at + 4)
         elif data.startswith(b"<![CDATA[", at):
             end = data.find(b"]]>", at + 9)
-        else:
+        elif data.startswith((b"<!", b"<?"), at):
             end = data.find(b">", at + 1)
-            if end != -1 and data[at + 1 : at + 2] not in (b"!", b"?"):
-                if end - at > _MAX_TAG_BYTES:
+        else:
+            tag = None if loose else _TAG.match(data, at)
+            if tag is None:
+                # Not well-formed, so the XML parser gives up and the loose one takes over.
+                # It ends every tag at the first ">", and so does the rest of this scan.
+                loose = True
+                end = data.find(b">", at + 1)
+                if end == -1:
+                    return  # a cut-off body
+            else:
+                end = tag.end() - 1
+            # Counted by "=", so that one long value (a data: URI) is not mistaken for many.
+            if data.count(b"=", at, end) > _MAX_TAG_ATTRIBUTES:
+                raise ParseError(_TOO_STRANGE)
+            if data[at + 1 : at + 2] == b"/":
+                depth = max(depth - 1, 0)  # the parser cannot go below the root either
+            elif data[end - 1 : end] != b"/":
+                depth += 1
+                if depth > _MAX_DEPTH:
                     raise ParseError(_TOO_STRANGE)
-                if data[at + 1 : at + 2] == b"/":
-                    depth = max(depth - 1, 0)  # the parser cannot go below the root either
-                elif data[end - 1 : end] != b"/":
-                    depth += 1
-                    if depth > _MAX_DEPTH:
-                        raise ParseError(_TOO_STRANGE)
         if end == -1:
             return
         at = data.find(b"<", end + 1)
@@ -154,15 +176,15 @@ def _parse(body: bytes, url: str, content_type: str = "") -> ParsedFeed:
     body = bytes(body)
     if not body.strip():
         raise ParseError(_EMPTY)
-    _refuse_hostile(body)
+    headers = (
+        {"content-type": content_type} if isinstance(content_type, str) and content_type else {}
+    )
+    _refuse_hostile(body, headers)
     base = url if isinstance(url, str) else ""
 
     # A stream, because feedparser would try a bare string as a URL or a file name.
     # It is given no base URL, so ids and links come back exactly as the source wrote them:
     # an Item's key must not change when the Feed's address does. html2md does the cleaning.
-    headers = (
-        {"content-type": content_type} if isinstance(content_type, str) and content_type else None
-    )
     result = feedparser.parse(
         io.BytesIO(body),
         response_headers=headers,
@@ -215,11 +237,14 @@ def _build_item(entry: object, base: str) -> Item | None:
     summary_html = _markup(entry, "summary")
     content_html, content_base = _content(entry, base)
     summary_base = _detail_base(entry.get("summary_detail"), base)
+    key_text = summary_html or content_html  # what the last-resort key has always hashed
+    if not isinstance(entry.get("summary_detail"), Mapping):
+        summary_html = ""  # feedparser's copy of an Atom <content>, which has its own type and base
     if not summary_html:
         summary_html, content_html = content_html, ""
         summary_base = content_base
 
-    key = _key(entry, title_html, summary_html)
+    key = _key(entry, title_html, key_text)
     if not key:
         return None
 
@@ -231,7 +256,7 @@ def _build_item(entry: object, base: str) -> Item | None:
     return Item(
         key=key,
         title=_cap(to_text(title_html)),
-        link=_resolve(entry.get("link"), base),
+        link=_resolve(_link(entry), base),
         summary=summary,
         content=content,
         author=_author(entry),
@@ -239,6 +264,20 @@ def _build_item(entry: object, base: str) -> Item | None:
         categories=_categories(entry),
         image=_image(entry, content_html, summary_html, base, content_base, summary_base),
     )
+
+
+def _link(entry: _Entry) -> object:
+    """The entry's link, unless it is only an opaque `<guid>` that feedparser took for one."""
+    link = entry.get("link")
+    if (
+        entry.get("guidislink")
+        and not entry.get("links")
+        and link == entry.get("id")
+        and isinstance(link, str)
+        and not link.strip().lower().startswith(("http://", "https://", "/"))
+    ):
+        return ""
+    return link
 
 
 def _key(entry: _Entry, title: str, text: str) -> str:

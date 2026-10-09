@@ -681,6 +681,7 @@ async def test_without_manage_webhooks_falls_back_to_the_bot_and_notifies_once(
     feed = world.feed()
     for _ in range(3):
         assert await world.deliverer.deliver(feed, AS_SITE) is DELIVERED
+    await world.deliverer.drain()
     assert len(world.text.sends.calls) == 3
     assert "username" not in world.text.sends.calls[0]
     assert world.db.get_webhook(TEXT) is None
@@ -692,15 +693,28 @@ async def test_without_manage_webhooks_falls_back_to_the_bot_and_notifies_once(
     world.client.cached[101] = other = FakeText(101)
     other.create_errors = [http_error(403, 50013)]
     assert await world.deliverer.deliver(world.feed(101), AS_SITE) is DELIVERED
+    await world.deliverer.drain()
     assert len(world.notifier.notes) == 2
 
 
 async def test_webhook_limit_falls_back_to_the_bot(world: World) -> None:
     world.text.create_errors = [http_error(400, 30007)]
     assert await world.deliverer.deliver(world.feed(), AS_SITE) is DELIVERED
+    await world.deliverer.drain()
     assert len(world.text.sends.calls) == 1
     ((_, text),) = world.notifier.notes
     assert "limit" in text
+
+
+async def test_a_failing_note_is_logged_and_does_not_fail_the_delivery(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    world.notifier.error = RuntimeError("notifier down")
+    world.text.create_errors = [http_error(403, 50013)]
+    assert await world.deliverer.deliver(world.feed(), AS_SITE) is DELIVERED
+    await world.deliverer.drain()  # the note is sent in the background
+    assert len(world.notifier.notes) == 1
+    assert "The notifier failed" in caplog.text
 
 
 async def test_fallback_works_without_a_notifier_or_with_a_failing_one(world: World) -> None:
@@ -712,6 +726,30 @@ async def test_fallback_works_without_a_notifier_or_with_a_failing_one(world: Wo
     world.text.create_errors = [http_error(403, 50013)]
     assert await bare.deliver(world.feed(), AS_SITE) is DELIVERED
     assert len(world.text.sends.calls) == 2
+
+
+async def test_a_hanging_note_does_not_hold_up_the_delivery(world: World) -> None:
+    async def hang(server_id: int, text: str) -> None:
+        await asyncio.Event().wait()
+
+    world.notifier.notify = hang  # type: ignore[method-assign]
+    world.text.create_errors = [http_error(403, 50013)]
+    outcome = await asyncio.wait_for(world.deliverer.deliver(world.feed(), AS_SITE), 1.0)
+    assert outcome is DELIVERED
+    assert len(world.text.sends.calls) == 1
+
+
+async def test_a_hanging_note_is_given_up_on(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """So that waiting for the notes at shutdown cannot last for ever."""
+
+    async def hang(server_id: int, text: str) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("rssbot.deliver.NOTE_TIMEOUT_S", 0.05)
+    world.notifier.notify = hang  # type: ignore[method-assign]
+    world.text.create_errors = [http_error(403, 50013)]
+    assert await world.deliverer.deliver(world.feed(), AS_SITE) is DELIVERED
+    await asyncio.wait_for(world.deliverer.drain(), 2.0)
 
 
 @pytest.mark.parametrize(
@@ -1029,6 +1067,25 @@ async def test_cleanup_webhook_never_raises(world: World, error: BaseException, 
     assert (world.db.get_webhook(TEXT) is not None) is kept
 
 
+@pytest.mark.parametrize("answer", [None, http_error(404, 10015)])
+async def test_cleanup_webhook_keeps_a_webhook_stored_while_its_delete_was_in_flight(
+    world: World, answer: BaseException | None
+) -> None:
+    world.db.set_webhook(TEXT, 77, "tok")
+    world.partials[77] = hook = FakeWebhook(77, "tok")
+
+    async def delete(**kwargs: Any) -> None:
+        # A delivery creates and stores a new webhook before Discord has answered.
+        world.db.set_webhook(TEXT, 88, "new")
+        if answer:
+            raise answer
+        hook.deleted = True
+
+    hook.delete = delete  # type: ignore[method-assign]
+    await world.deliverer.cleanup_webhook(TEXT)
+    assert world.db.get_webhook(TEXT) == (88, "new")
+
+
 async def test_a_cover_send_cut_off_is_not_sent_again_without_the_cover(world: World) -> None:
     world.forum.posts.errors.append(ConnectionResetError())
     assert await world.deliverer.deliver(world.forum_feed(), WITH_COVER) is UNKNOWN
@@ -1181,6 +1238,7 @@ async def test_the_post_as_warning_reaches_the_logs_channel_as_an_embed(
     )
     world.text.create_errors = [http_error(403, 50013)]
     assert await deliverer.deliver(world.feed(), AS_SITE) is DELIVERED
+    await deliverer.drain()
     (call,) = logs.sends.calls
     (embed,) = call["embeds"]
     assert "Manage Webhooks" in embed.description and f"<#{TEXT}>" in embed.description

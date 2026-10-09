@@ -197,6 +197,8 @@ class Bot(discord.Client):
         # Reports already on their way go out while Discord is still connected; each is bounded.
         with contextlib.suppress(Exception):
             await self.journal.drain()
+        with contextlib.suppress(Exception):
+            await self.deliverer.drain()
         await super().close()
         with contextlib.suppress(Exception):
             await self.fetcher.close()

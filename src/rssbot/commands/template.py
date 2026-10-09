@@ -428,14 +428,17 @@ async def embed_submitted(
         else:
             _check_address("The Embed link", parts["url"])
             _check_address("The Embed image", parts["image"])
-            await service.set_embed(
+            saved = await service.set_embed(
                 feed.server_id,
                 feed.id,
                 **parts,
                 colour=_colour_of(ids[1]),
                 actor=ui.actor_of(interaction),
             )
-            headline = f"Saved the Embed of {_name(feed)}."
+            if saved.embed is None:  # a link alone: the service keeps no Embed that shows nothing
+                headline = f"{_name(feed)} has no Embed now: a link alone shows nothing."
+            else:
+                headline = f"Saved the Embed of {_name(feed)}."
     except (ServiceError, ui.UserError) as exc:
         sent = [
             ("Title", parts["title"]),

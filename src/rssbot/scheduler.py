@@ -612,7 +612,7 @@ class Scheduler:
                     len(queue) - started,
                 )
                 return None, True
-            if started and not self._wants_posts(feed):
+            if not self._wants_posts(feed):
                 log.info("check.feed_changed feed=%s name=%s", feed.id, quote(feed.name))
                 raise _FeedChanged
             try:
@@ -650,8 +650,9 @@ class Scheduler:
     def _wants_posts(self, feed: Feed) -> bool:
         """Whether the Feed still exists, is not paused and posts where it did.
 
-        Looked at between Items: a Manager may pause, move or delete the Feed during a long
-        Check, and the Items left would go to the old channel or fail one by one.
+        Looked at before each Item, the first too (the cover lookups before it take a while): a
+        Manager may pause, move or delete the Feed during a long Check, and the Items left
+        would go to the old channel or fail one by one.
         """
         try:
             current = self._db.get_feed(feed.id)

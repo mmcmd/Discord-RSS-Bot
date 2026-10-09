@@ -127,6 +127,12 @@ async def gzipped(request: web.Request) -> web.Response:
     return web.Response(body=gzip.compress(FEED_BODY), headers={"Content-Encoding": "gzip"})
 
 
+async def long_header(request: web.Request) -> web.Response:
+    # Sites do send a Content-Security-Policy this long.
+    headers = {"Content-Security-Policy": "default-src " + "a" * 20_000}
+    return web.Response(body=FEED_BODY, headers=headers, content_type="application/rss+xml")
+
+
 async def slow(request: web.Request) -> web.Response:
     await asyncio.sleep(30)
     return web.Response(body=FEED_BODY)
@@ -205,6 +211,7 @@ async def site() -> AsyncIterator[Site]:
             web.get("/endless", endless),
             web.get("/bomb", bomb),
             web.get("/gzipped", gzipped),
+            web.get("/long-header", long_header),
             web.get("/slow", slow),
             web.get("/drop", drop),
             web.get("/status/{code}", status),
@@ -291,6 +298,13 @@ async def test_not_modified_keeps_previous_validators_when_the_site_sends_none(
 async def test_unasked_304_is_an_error(site: Site, open_fetcher: HttpFetcher) -> None:
     with pytest.raises(FetchError, match="304"):
         await open_fetcher.fetch(site.url("/bare304"))
+
+
+async def test_a_response_with_a_very_long_header_is_read(
+    site: Site, open_fetcher: HttpFetcher
+) -> None:
+    result = await open_fetcher.fetch(site.url("/long-header"))
+    assert result.body == FEED_BODY
 
 
 async def test_validator_with_a_line_break_is_not_sent(

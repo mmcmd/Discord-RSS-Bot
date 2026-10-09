@@ -2420,6 +2420,40 @@ async def test_pages_are_fetched_at_most_ten_at_a_time(make):
     assert 1 < bench.sources.peak <= 10
 
 
+@pytest.mark.parametrize("change", ["deleted", "paused", "moved"])
+async def test_a_feed_changed_while_covers_are_looked_up_posts_nothing(make, caplog, change):
+    bench = make()
+    feed = await bench.started("a", item("old"))
+    first, second = item("n1", 2), item("n2", 1)
+    bench.sources.pages[first.link] = bench.sources.pages[second.link] = article("")
+    bench.publish(feed, first, second)
+    bench.wait(feed)
+    due = bench.feed(feed).next_check_at
+
+    def act(url: str) -> None:
+        if url != first.link:  # a Manager acts while the pages are looked up
+            return
+        if change == "deleted":
+            bench.db.delete_feed(feed.id)
+        elif change == "paused":
+            bench.db.update_feed(feed.id, paused=PauseReason.MANUAL)
+        else:
+            bench.db.update_feed(feed.id, channel_id=777)
+
+    bench.sources.during_fetch = act
+    with caplog.at_level(logging.DEBUG):
+        await bench.scheduler.check_feed(feed.id)
+
+    assert bench.deliverer.attempts == []
+    assert [r for r in caplog.records if r.exc_info] == []
+    if change != "deleted":
+        # As when the Feed changes before a later Item: not recorded, nothing overwritten.
+        assert bench.status(feed, "n1") is None and bench.status(feed, "n2") is None
+        stored = bench.db.get_feed(feed.id)
+        assert (stored.fail_count, stored.last_error) == (0, "")
+        assert stored.next_check_at == due
+
+
 async def test_the_default_rendering_after_a_refusal_does_not_ask_for_the_cover_again(make):
     bench = make()
     bench.render.cover = bench.render_default.cover = "https://cdn.example/cover.png"

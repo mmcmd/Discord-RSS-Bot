@@ -47,6 +47,7 @@ MAX_REDIRECTS = 5
 TIMEOUT_S = 30.0
 MAX_URL_LENGTH = 2048
 MAX_RETRY_AFTER_S = 6 * 60 * 60.0
+MAX_HEADER_BYTES = 64 * 1024  # per response header line and field; aiohttp allows 8190
 DEFAULT_USER_AGENT = "discord-rss-bot/0.1 (+https://github.com/mmcmd/Discord-RSS-Bot)"
 
 REFUSED_MESSAGE = (
@@ -571,5 +572,7 @@ class HttpFetcher:
                 trust_env=False,  # no proxies or netrc from the environment
                 cookie_jar=aiohttp.DummyCookieJar(),  # nothing carries over between sites
                 timeout=aiohttp.ClientTimeout(total=None),  # _request holds the one time limit
+                max_line_size=MAX_HEADER_BYTES,  # the 8 KiB default refuses a big CSP or cookie
+                max_field_size=MAX_HEADER_BYTES,
             )
         return self._session

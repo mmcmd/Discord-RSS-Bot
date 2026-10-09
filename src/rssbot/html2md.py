@@ -291,7 +291,7 @@ def _wrap(kind: str, inner: str, url: str, bare_ok: bool, in_code: bool) -> str:
         if not url:
             return inner
         if not core:
-            return inner + url if bare_ok else inner
+            return f"{inner} {url} " if bare_ok else inner  # spaces keep it off its neighbours
     if not core:
         return inner
     lead = inner[: len(inner) - len(inner.lstrip())]

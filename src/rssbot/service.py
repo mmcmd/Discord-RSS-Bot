@@ -18,6 +18,7 @@ import contextlib
 import enum
 import logging
 import random
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
@@ -298,10 +299,7 @@ class FeedService:
         else:
             custom_name = custom_avatar = ""
         self._refuse_duplicate(channel_id, url)
-        if self._db.count_feeds(server_id) >= MAX_FEEDS_PER_SERVER:
-            raise ServiceError(
-                f"This Server already has {MAX_FEEDS_PER_SERVER} Feeds, the most allowed."
-            )
+        self._refuse_past_the_limit(server_id)
 
         parsed, result = await self._read(url)
         identity = None
@@ -310,6 +308,7 @@ class FeedService:
 
         # Nothing is awaited from here on, so the Feed and its Seen items appear together.
         self._refuse_duplicate(channel_id, url)
+        self._refuse_past_the_limit(server_id)  # others may have been added during the fetch
         now = self._clock.now()
         feed = self._db.create_feed(
             server_id=server_id,
@@ -390,7 +389,8 @@ class FeedService:
             changes["name"] = new_name
         if new_interval is not None and new_interval != feed.interval_s:
             changes["interval_s"] = new_interval
-            changes["next_check_at"] = min(feed.next_check_at, now + new_interval)
+            if feed.rate_limited_since is None:  # else its source asked for the wait
+                changes["next_check_at"] = min(feed.next_check_at, now + new_interval)
         if parsed is not None and result is not None:
             changes.update(
                 url=new_url,
@@ -416,13 +416,16 @@ class FeedService:
             changes.update(channel_id=target_channel, forum_tag_ids=())
             if feed.paused in (PauseReason.LOST_CHANNEL, PauseReason.NEEDS_TAG):
                 changes["paused"] = None
-                changes.setdefault("next_check_at", now)
+                due = max(feed.next_check_at, now) if feed.rate_limited_since is not None else now
+                changes.setdefault("next_check_at", due)
         if channel_kind is not None and ChannelKind(channel_kind) != feed.channel_kind:
             changes["channel_kind"] = ChannelKind(channel_kind)
 
-        updated = self._update(feed.id, **changes)
         if parsed is not None:
+            # First, so that a failing write leaves the old address: the new one without its
+            # starting point would post everything the source lists. Extra Seen items are harmless.
             self._baseline(feed.id, parsed, now)
+        updated = self._update(feed.id, **changes)
         edits = _edits(feed, updated)
         if edits:
             # Moved out of the channel the bot had paused it over, it is checked again.
@@ -600,9 +603,8 @@ class FeedService:
         if feed.embed is None or not 1 <= position <= len(fields):
             raise ServiceError(f"There is no Field number {position}.")
         kept = fields[: position - 1] + fields[position:]
-        return self._change_template(
-            actor, feed, f"removed Field {position}", embed=replace(feed.embed, fields=kept)
-        )
+        embed = replace(feed.embed, fields=kept)
+        return self._change_template(actor, feed, f"removed Field {position}", embed=embed)
 
     async def add_button(
         self, server_id: int, feed_id: int, label: str, url: str, *, actor: Actor
@@ -729,7 +731,9 @@ class FeedService:
             raise ServiceError(f"A Forum post can have at most {MAX_FORUM_TAGS} tags.")
         changes: dict[str, Any] = {"forum_tag_ids": ids}
         if ids and feed.paused is PauseReason.NEEDS_TAG:
-            changes.update(paused=None, next_check_at=self._clock.now())
+            now = self._clock.now()
+            due = max(feed.next_check_at, now) if feed.rate_limited_since is not None else now
+            changes.update(paused=None, next_check_at=due)
         updated = self._update(feed.id, **changes)
         resumed = "paused" in changes
         if ids != feed.forum_tag_ids:
@@ -877,6 +881,9 @@ class FeedService:
 
     def _change_template(self, actor: Actor, feed: Feed, what: str, **changes: Any) -> Feed:
         """Store a change to the Template. `what` names the part, never its text."""
+        embed = changes.get("embed")
+        if embed is not None and embed.is_empty:
+            changes["embed"] = None  # as in render: nothing to show, so no Embed is posted
         updated = self._update(feed.id, **changes)
         if any(getattr(feed, name) != value for name, value in changes.items()):
             self._log(actor, LogKind.TEMPLATE_CHANGED, updated, detail=what)
@@ -941,6 +948,12 @@ class FeedService:
         for feed in self._db.list_channel_feeds(channel_id):
             if feed.url == url and feed.id != but:
                 raise DuplicateFeed("That channel already has a Feed for that address.")
+
+    def _refuse_past_the_limit(self, server_id: int) -> None:
+        if self._db.count_feeds(server_id) >= MAX_FEEDS_PER_SERVER:
+            raise ServiceError(
+                f"This Server already has {MAX_FEEDS_PER_SERVER} Feeds, the most allowed."
+            )
 
     def _baseline(self, feed_id: int, parsed: ParsedFeed, now: int) -> None:
         """Record everything the source lists as Seen, so that none of it is posted.
@@ -1029,7 +1042,7 @@ def _clean_url(url: str) -> str:
     url = url.strip()
     if not url:
         raise ServiceError("The Feed address cannot be empty.")
-    if "://" not in url:
+    if not re.match(r"[^/?#]*://", url):  # a "://" later on is part of the path or query
         url = "https://" + url
     if len(url) > MAX_URL_CHARS:
         raise ServiceError(f"The Feed address can be at most {MAX_URL_CHARS} characters long.")

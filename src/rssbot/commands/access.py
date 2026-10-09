@@ -20,6 +20,7 @@ LEVEL_CHOICES = [
     app_commands.Choice(name="Manager", value=Level.MANAGER.value),
 ]
 
+MAX_ID_DIGITS = 20  # longest text worth passing to int(), which refuses thousands of digits
 SCAFFOLDING = 300  # room kept in /access list for headings, labels and the note
 MORE_WORDS = 20  # room kept for "…and 12 more"
 
@@ -162,9 +163,11 @@ async def revoke_command(
         shown = _mention(found_id, kind)
     elif target_id is not None and target_id.strip().strip("<@&!>").isdecimal():
         # A deleted role or departed member cannot be picked, only named by ID.
-        found_id = int(target_id.strip().strip("<@&!>"))
-        if found_id > ui.MAX_ID:
+        digits = target_id.strip().strip("<@&!>")
+        # Text over 20 digits is no ID, and int() raises on over 4300 digits.
+        if len(digits) > MAX_ID_DIGITS or int(digits) > ui.MAX_ID:
             raise ui.UserError("That is not a valid ID.")
+        found_id = int(digits)
         shown = f"`{found_id}`"
     else:
         raise ui.UserError("Choose a role or member, or give the ID of one that no longer exists.")

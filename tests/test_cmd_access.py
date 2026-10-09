@@ -264,7 +264,11 @@ async def test_revoke_by_id(db: Database) -> None:
     assert sent_text(interaction) == f"Took away the Grant of `{ROLE_ID}`."
 
 
-@pytest.mark.parametrize("target_id", ["99999999999999999999", str(ui.MAX_ID + 1)])
+@pytest.mark.parametrize(
+    "target_id",
+    ["99999999999999999999", str(ui.MAX_ID + 1), "9" * 5000, f"<@&{'9' * 5000}>"],
+    ids=["20 digits", "over the maximum", "5000 digits", "5000 digits in a mention"],
+)
 async def test_revoke_refuses_an_id_too_large_to_be_one(db: Database, target_id: str) -> None:
     db.set_grant(SERVER, ROLE_ID, TargetKind.ROLE, Level.MANAGER)
     interaction = admin(db)

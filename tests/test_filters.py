@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import time
 
 import pytest
 
@@ -330,6 +331,93 @@ def test_a_word_inside_a_link_address_does_not_match(word, body):
 def test_the_visible_words_around_a_link_still_match(word, body):
     assert not passes(item(summary=body), [block(word)])
     assert passes(item(content=body), [must(word, FilterField.DESCRIPTION)])
+
+
+# --- formatting marks are not words -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("word", "body"),
+    [
+        ("breaking news", "Breaking **news** today"),
+        ("breaking news", "**Breaking** news today"),
+        ("breaking news", "**B**reaking news"),
+        ("sponsored post", "**Sponsored** post: buy now"),
+        ("sponsored", "**S**ponsored"),
+        ("press release", "a *press* release"),
+        ("press release", "a ***press** release*"),
+        ("old news", "~~old~~ news"),
+        ("open source", "`open` source"),
+        ("open source", "``open`` source"),
+        ("is great", "> open source is\n> great stuff"),
+        ("is great", "> open source is\n\n> great stuff"),
+        ("open source", "```\nopen source\n```"),
+    ],
+)
+def test_a_phrase_matches_across_the_marks_around_words(word, body):
+    for field in (FilterField.ANY, FilterField.DESCRIPTION):
+        assert not passes(item(title="Budget", summary=body), [block(word, field)])
+        assert not passes(item(title="Budget", content=body), [block(word, field)])
+        assert passes(item(title="Budget", summary=body), [must(word, field)])
+        assert passes(item(title="Budget", content=body), [must(word, field)])
+
+
+@pytest.mark.parametrize(
+    ("word", "body"),
+    [
+        ("c*", "I learned C* today"),
+        ("*", "5 * 3"),
+        ("**bold**", "a **bold** claim"),
+        ("`x`", "call `x` now"),
+        ("~~old~~", "~~old~~ news"),
+        ("> quote", "> quote"),
+        ("[live]", "[LIVE] from the match"),
+    ],
+)
+def test_a_word_with_a_mark_in_it_still_matches_as_written(word, body):
+    assert not passes(item(summary=body), [block(word)])
+    assert passes(item(content=body), [must(word, FilterField.DESCRIPTION)])
+
+
+def test_marks_are_only_taken_out_of_the_description():
+    assert not passes(item(title="Breaking **news**"), [must("breaking news")])
+    assert not passes(item(author="*Ann* Lee"), [must("ann lee", FilterField.AUTHOR)])
+    assert not passes(item(categories=("`open` source",)), [must("open source")])
+    assert passes(item(title="C* rocks"), [must("c*", FilterField.TITLE)])
+
+
+@pytest.mark.parametrize(
+    ("word", "body"),
+    [
+        ("foo bar", "foo * bar"),
+        ("ab", "a*b"),
+        ("210", "2**10"),
+        ("5 3", "5 * 3 * 2"),
+        ("ab", "a~~b"),
+        ("ab", "a`b"),
+        ("ab", "a**b"),
+        ("foo bar", "foo ~~ bar"),
+        ("foo bar", "foo ` bar"),
+        ("foo bar", "foo ** bar *"),
+        ("foo bar", "** foo ** bar"),
+    ],
+)
+def test_a_mark_that_is_only_a_character_is_not_taken_out(word, body):
+    for field in (FilterField.ANY, FilterField.DESCRIPTION):
+        assert passes(item(title="Budget", summary=body), [block(word, field)])
+        assert passes(item(title="Budget", content=body), [block(word, field)])
+        assert not passes(item(title="Budget", summary=body), [must(word, field)])
+
+
+def test_marks_are_taken_out_in_linear_time():
+    for text in ("*" * 100_000, "*a" * 50_000, "`a" * 50_000, "~~a" * 33_000, "*a " * 33_000):
+        started = time.perf_counter()
+        assert passes(item(summary=text), [block("zzz")])
+        assert time.perf_counter() - started < 1.0
+
+
+def test_a_phrase_does_not_match_across_list_items():
+    assert passes(item(summary="- first\n- second"), [block("first second")])
 
 
 def test_a_title_is_plain_text_and_is_matched_as_it_is():

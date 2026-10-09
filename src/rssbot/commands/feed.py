@@ -192,7 +192,7 @@ def _access_warning(
     if not missing:
         return ""
     mention = ui.channel_mention(channel_id)
-    if "View Channel" in missing or "Send Messages" in missing:
+    if {"View Channel", "Send Messages", "Send Messages in Threads"} & set(missing):
         return (
             f"**Warning**: the bot cannot see or post in {mention}. "
             "Nothing will be posted until the bot is given access to it."
@@ -338,6 +338,10 @@ class BackToPanel(ui.ActionButton, action="feed_panel", ids=1, requires=Level.MA
 
 
 async def _show_settings_form(interaction: discord.Interaction, feed: Feed) -> None:
+    # Discord may refuse a pre-selected channel that was deleted since; the Feed stays bound to it.
+    # Not in the cache is not deleted (an archived thread is dropped too), so with no default
+    # to show the field is optional: leaving it empty keeps the Feed where it is.
+    channel_here = ui.cached_channel(interaction, feed.channel_id) is not None
     await ui.show_form(
         interaction,
         "feed_edit",
@@ -350,7 +354,8 @@ async def _show_settings_form(interaction: discord.Interaction, feed: Feed) -> N
                 "channel",
                 "Channel",
                 channel_types=FEED_CHANNEL_TYPES,
-                default_id=feed.channel_id,
+                default_id=feed.channel_id if channel_here else None,
+                required=channel_here,
                 description="Where the Feed's Items are posted.",
             ),
             ui.choice_field(
@@ -368,10 +373,10 @@ async def _settings_submitted(
     interaction: discord.Interaction, ids: tuple[int, ...], values: ui.FormValues
 ) -> None:
     feed = ui.feed_of(interaction, ids[0])
-    picked = _picked_channel(interaction, values)
+    picked = values.channel("channel")  # None: left empty, the Feed stays in its channel
     interval = _picked_interval(values)
-    moved = picked.id != feed.channel_id
-    kind = _kind_of(interaction, picked) if moved else None
+    moved_to = picked if picked is not None and picked.id != feed.channel_id else None
+    kind = _kind_of(interaction, moved_to) if moved_to else None
     in_place = _from_message(interaction)
     await ui.defer(interaction, update=in_place)
     updated, old_channel_id = await _service(interaction).edit_feed(
@@ -379,7 +384,7 @@ async def _settings_submitted(
         feed.id,
         name=values.text("name"),
         url=values.text("url"),
-        channel_id=picked.id if moved else None,
+        channel_id=moved_to.id if moved_to else None,
         channel_kind=kind,
         interval_s=interval,
         actor=ui.actor_of(interaction),

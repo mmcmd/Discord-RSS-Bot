@@ -402,19 +402,19 @@ def missing_post_permissions(
 ) -> list[str] | None:
     """The permissions the bot lacks to post in a channel, by name; None when the cache cannot tell.
 
-    A thread also needs Send Messages in Threads, and an Embed needs Embed Links.
+    A thread needs Send Messages in Threads instead of Send Messages (its parent's Send Messages
+    does not apply there), and an Embed needs Embed Links.
     """
     guild = interaction.guild
     channel = cached_channel(interaction, channel_id)
     if guild is None or channel is None or guild.me is None:
         return None
     permissions = channel.permissions_for(guild.me)
-    needed = [
-        ("View Channel", permissions.view_channel),
-        ("Send Messages", permissions.send_messages),
-    ]
+    needed = [("View Channel", permissions.view_channel)]
     if getattr(channel, "type", None) in THREAD_TYPES:
         needed.append(("Send Messages in Threads", permissions.send_messages_in_threads))
+    else:
+        needed.append(("Send Messages", permissions.send_messages))
     if embed:
         needed.append(("Embed Links", permissions.embed_links))
     return [name for name, granted in needed if not granted]

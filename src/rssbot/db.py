@@ -449,7 +449,9 @@ class Database:
     def purge_removed_servers(self, before: int) -> list[int]:
         """Delete Servers removed before `before`, with everything they own. Returns their ids."""
         with self._transaction():
-            # Webhooks hang off channels, not Servers, so the cascade cannot reach them.
+            # Webhooks hang off channels, not Servers, so the cascade cannot reach them. Those of
+            # channels with no Feed name no Server: the periodic cleanup of unused webhooks
+            # retries them, and a Server the bot has left answers 403 or 404.
             self._conn.execute(
                 "DELETE FROM webhooks WHERE channel_id IN ("
                 " SELECT f.channel_id FROM feeds f JOIN servers s ON s.server_id = f.server_id"
@@ -459,11 +461,6 @@ class Database:
             rows = self._all(
                 "DELETE FROM servers WHERE removed_at < ? RETURNING server_id", (before,)
             )
-            if rows:
-                # Also those left behind by a channel whose last Feed was removed earlier.
-                self._conn.execute(
-                    "DELETE FROM webhooks WHERE channel_id NOT IN (SELECT channel_id FROM feeds)"
-                )
         return sorted(row["server_id"] for row in rows)
 
     # -- Grants --

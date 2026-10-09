@@ -600,6 +600,24 @@ async def test_empty_text_with_an_embed_posts_only_the_embed(
     assert message.content == "" and message.embed is not None
 
 
+async def test_empty_text_after_removing_the_only_field_posts_the_default_text(
+    db: Database, service: FeedService, feed: Feed
+) -> None:
+    # The Field made an Embed that held nothing else: with the Field gone, there is none.
+    await service.add_field(SERVER, feed.id, "By", "{{author}}", actor=MEMBER)
+    added = stored(db, feed)
+    interaction = manager(db, service, type=COMPONENT)
+    await click(interaction, template.RemoveField(feed.id), option_values(added, "fields")[0])
+    assert stored(db, feed).embed is None
+
+    interaction = await submit(db, service, f"rss:m:tpl_text:{feed.id}", text="")
+
+    assert "only its Embed is posted" not in interaction.text
+    assert "Until it has an Embed, the default message text is posted." in interaction.text
+    message, _ = await service.preview(SERVER, feed.id)
+    assert message.content != "" and message.embed is None
+
+
 # -- embed --
 
 EMBED = EmbedSpec(
@@ -748,6 +766,27 @@ async def test_an_out_of_range_colour_in_the_form_id_is_refused(
     interaction = await submit(db, service, f"rss:m:tpl_embed:{feed.id}:{code}", title="T")
     assert stored(db, feed).embed == EMBED
     assert "The colour must be a hex code" in interaction.text
+
+
+async def test_saving_an_embed_form_with_only_a_link_means_no_embed(
+    db: Database, service: FeedService
+) -> None:
+    feed = make_feed(db, embed=EMBED)
+    interaction = await submit(
+        db,
+        service,
+        f"rss:m:tpl_embed:{feed.id}:{0xFF8800 + 2}",
+        title="",
+        description="",
+        url="https://example.com/",
+        image="",
+        footer="",
+    )
+
+    assert stored(db, feed).embed is None
+    sent = interaction.last[1]
+    assert "**News** has no Embed now: a link alone shows nothing." in sent["content"]
+    assert "Saved the Embed" not in sent["content"]
 
 
 async def test_saving_an_empty_embed_form_means_no_embed(

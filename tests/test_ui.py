@@ -799,6 +799,26 @@ def test_bot_can_post_needs_the_permissions_the_channel_and_message_ask_for(db: 
     assert ui.missing_post_permissions(interaction, 4) is None
 
 
+def test_a_thread_needs_send_messages_in_threads_not_send_messages(db: Database) -> None:
+    thread = discord.ChannelType.public_thread
+    channels = (
+        FakeChannel(1, type=thread, lacking=("send_messages",)),
+        FakeChannel(2, type=thread, lacking=("send_messages_in_threads",)),
+        FakeChannel(3, type=thread, lacking=("view_channel", "send_messages_in_threads")),
+        FakeChannel(4, lacking=("send_messages",)),
+    )
+    interaction = FakeInteraction(db, channels=channels)
+    # The usual read-only channel with discussion in threads: the parent denies Send Messages.
+    assert ui.missing_post_permissions(interaction, 1) == []
+    assert ui.bot_can_post(interaction, 1) is True
+    assert ui.missing_post_permissions(interaction, 2) == ["Send Messages in Threads"]
+    assert ui.missing_post_permissions(interaction, 3) == [
+        "View Channel",
+        "Send Messages in Threads",
+    ]
+    assert ui.missing_post_permissions(interaction, 4) == ["Send Messages"]
+
+
 # -- Pop-up forms --
 
 submitted: list[tuple[tuple[int, ...], ui.FormValues]] = []

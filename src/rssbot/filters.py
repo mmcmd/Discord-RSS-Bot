@@ -32,6 +32,15 @@ _NOT_BEFORE_WORD = f"(?:{_NOT_BEFORE}|(?=[{_UNSPACED}]))"
 _LINK = re.compile(r"!?\[([^\[\]\n]*)\]\(https?://[^\s()]*\)")
 _ADDRESS = re.compile(r"https?://\S+")
 
+# html2md also marks emphasis (`*`, `**`), strikethrough (`~~`), code (backticks and fences) and
+# quotes (a leading `>` on each line). A phrase runs through them, so a description is also
+# matched with them taken out. Only the marks: html2md does not escape a `*` that is just a
+# character, as in "a * b" or "2**10", and that one stays.
+_QUOTE = re.compile(r"^[ \t]*> ?", re.MULTILINE)
+_EMPHASIS = re.compile(r"\*+")
+_STRIKE = re.compile(r"~{2,}")
+_CODE = re.compile(r"`+")
+
 
 def normalise_word(word: str) -> str:
     """Trim and collapse inner whitespace to single spaces."""
@@ -58,6 +67,75 @@ def _visible(markdown: str) -> str:
     return _ADDRESS.sub(" ", _LINK.sub(r"\1", markdown))
 
 
+def _strip_code(text: str) -> str:
+    """`text` without the backticks that open and close a code span: a run of backticks is
+    closed by the next run of the same length, and one with no such run is a character."""
+    runs = list(_CODE.finditer(text))
+    closing: list[int | None] = [None] * len(runs)
+    latest: dict[int, int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        length = len(runs[index].group())
+        closing[index] = latest.get(length)
+        latest[length] = index
+    left = [len(run.group()) for run in runs]
+    index = 0
+    while index < len(runs):
+        end = closing[index]
+        if end is None:
+            index += 1
+        else:
+            left[index] = left[end] = 0
+            index = end + 1
+    return _keep(text, runs, left)
+
+
+def _strip_pairs(text: str, pattern: re.Pattern[str]) -> str:
+    """`text` without the runs of `pattern` that open and close a mark, as Discord reads
+    them: a run with a space after it cannot open, one with a space before it cannot close,
+    and one with no partner is a character (a*b)."""
+    runs = list(pattern.finditer(text))
+    left = [len(run.group()) for run in runs]
+    opening: list[int] = []
+    for index, run in enumerate(runs):
+        before = text[run.start() - 1] if run.start() else " "
+        after = text[run.end()] if run.end() < len(text) else " "
+        if not before.isspace():
+            while left[index] and opening:
+                other = opening[-1]
+                paired = min(left[index], left[other])
+                left[index] -= paired
+                left[other] -= paired
+                if not left[other]:
+                    opening.pop()
+        if left[index] and not after.isspace():
+            opening.append(index)
+    return _keep(text, runs, left)
+
+
+def _keep(text: str, runs: list[re.Match[str]], left: list[int]) -> str:
+    """`text` with only the first `left[n]` characters of its n-th run."""
+    parts: list[str] = []
+    at = 0
+    for run, count in zip(runs, left, strict=True):
+        parts.append(text[at : run.start()])
+        parts.append(run.group()[:count])
+        at = run.end()
+    parts.append(text[at:])
+    return "".join(parts)
+
+
+def _unmarked(visible: str) -> str:
+    """The visible words without the marks html2md puts around them."""
+    text = _strip_code(_QUOTE.sub("", visible))
+    return _strip_pairs(_strip_pairs(text, _STRIKE), _EMPHASIS)
+
+
+def _described(markdown: str) -> tuple[str, str]:
+    """A description as it reads, and without its marks: a Filter word may match either."""
+    visible = _visible(markdown)
+    return visible, _unmarked(visible)
+
+
 def _contains(texts: Iterable[str], word: str) -> bool:
     pattern = _pattern(word)
     if pattern is None:
@@ -69,12 +147,12 @@ def _texts(item: Item, field: FilterField) -> Iterable[str]:
     if field == FilterField.TITLE:
         return (item.title,)
     if field == FilterField.DESCRIPTION:
-        return (_visible(item.summary), _visible(item.content))
+        return (*_described(item.summary), *_described(item.content))
     if field == FilterField.CATEGORY:
         return item.categories  # each category is matched on its own
     if field == FilterField.AUTHOR:
         return (item.author,)
-    return (item.title, _visible(item.summary), _visible(item.content))
+    return (item.title, *_described(item.summary), *_described(item.content))
 
 
 def _matches(item: Item, flt: Filter) -> bool:

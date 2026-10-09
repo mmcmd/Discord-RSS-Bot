@@ -438,6 +438,36 @@ async def test_add_refuses_a_bad_address(service: FeedService, web: Web, url: st
     assert web.calls == []
 
 
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "example.com/feed",
+        "example.com:8080/feed",
+        "example.com/feed?src=https://x.example/",
+        "example.com/redirect#https://x.example/",
+        "example.com/https://x.example/feed",
+    ],
+)
+async def test_add_gives_an_address_without_a_scheme_https(
+    service: FeedService, web: Web, typed: str
+) -> None:
+    web.listings["https://" + typed] = listing("a")
+    feed = await add(service, typed)
+    assert feed.url == "https://" + typed
+
+
+@pytest.mark.parametrize(
+    "typed", ["feed://example.com/feed", "feed:https://example.com/feed", "ftp://example.com/feed"]
+)
+async def test_add_refuses_an_address_with_another_scheme(
+    service: FeedService, web: Web, typed: str
+) -> None:
+    assert "starting with http or https" in await error(
+        service.add_feed(SERVER, CHANNEL, MESSAGES, typed, actor=ALEX)
+    )
+    assert web.calls == []
+
+
 async def test_add_refuses_when_the_fetch_fails(
     service: FeedService, db: Database, web: Web
 ) -> None:
@@ -456,6 +486,56 @@ async def test_add_refuses_what_is_not_a_feed(service: FeedService, db: Database
         service.add_feed(SERVER, CHANNEL, MESSAGES, URL, actor=ALEX)
     )
     assert db.count_feeds(SERVER) == 0
+
+
+async def test_add_refuses_past_the_most_feeds_a_server_may_have(
+    service: FeedService, db: Database, web: Web, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("rssbot.service.MAX_FEEDS_PER_SERVER", 2)
+    await add(service)
+    await add(service, URL2)
+    assert "already has 2 Feeds, the most allowed" in await error(
+        service.add_feed(SERVER, CHANNEL, MESSAGES, "https://third.example/", actor=ALEX)
+    )
+    assert db.count_feeds(SERVER) == 2
+    await service.add_feed(OTHER_SERVER, OTHER_CHANNEL, MESSAGES, URL, actor=SAM)  # not shared
+
+
+async def test_adds_at_the_same_time_do_not_pass_the_most_feeds_a_server_may_have(
+    service: FeedService, db: Database, web: Web, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("rssbot.service.MAX_FEEDS_PER_SERVER", 3)
+    urls = [f"https://many.example/{number}" for number in range(6)]
+    for url in urls:
+        web.listings[url] = listing("a")
+    await add(service)
+
+    results = await asyncio.gather(
+        *(service.add_feed(SERVER, CHANNEL, MESSAGES, url, actor=ALEX) for url in urls),
+        return_exceptions=True,
+    )
+
+    assert db.count_feeds(SERVER) == 3
+    assert sum(isinstance(result, ServiceError) for result in results) == 4
+
+
+async def test_import_does_not_pass_the_most_feeds_a_server_may_have(
+    service: FeedService, db: Database, web: Web, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("rssbot.service.MAX_FEEDS_PER_SERVER", 3)
+    entries = []
+    for number in range(8):
+        url = f"https://many.example/{number}"
+        web.listings[url] = listing("a")
+        entries.append((f"Feed {number}", url))
+    await add(service)
+
+    result = await service.import_opml(SERVER, CHANNEL, MESSAGES, opml(*entries), actor=ALEX)
+
+    assert db.count_feeds(SERVER) == 3
+    assert len(result.added) == 2
+    assert len(result.failed) == 6
+    assert all("the most allowed" in failed.reason for failed in result.failed)
 
 
 async def test_add_refuses_the_same_address_twice_in_one_channel(service: FeedService) -> None:
@@ -947,6 +1027,7 @@ async def test_set_embed_part_by_part(service: FeedService) -> None:
 )
 async def test_embed_colours(service: FeedService, colour: int | str, stored: int) -> None:
     feed = await add(service)
+    await service.set_embed(SERVER, feed.id, title="T", actor=ALEX)  # a colour alone is not stored
     feed = await service.set_embed(SERVER, feed.id, colour=colour, actor=ALEX)
     assert feed.embed is not None and feed.embed.colour == stored
 
@@ -1005,6 +1086,63 @@ async def test_fields(service: FeedService) -> None:
     for position in (0, 3, -1):
         message = await error(service.remove_field(SERVER, feed.id, position, actor=ALEX))
         assert message == f"There is no Field number {position}."
+
+
+async def test_removing_the_last_field_of_a_made_up_embed_removes_the_embed(
+    service: FeedService, journal: Journal, db: Database
+) -> None:
+    feed = await add(service)
+    feed = await service.add_field(SERVER, feed.id, "By", "{{author}}", actor=ALEX)
+    assert feed.embed is not None
+
+    feed = await service.remove_field(SERVER, feed.id, 1, actor=ALEX)
+
+    assert feed.embed is None
+    assert service.get_feed(SERVER, feed.id).embed is None
+    await journal.drain()
+    details = [entry.detail for entry in db.list_log_entries(SERVER, limit=10)]
+    assert "removed Field 1" in details
+
+
+async def test_removing_the_last_field_keeps_an_embed_with_something_to_show(
+    service: FeedService,
+) -> None:
+    feed = await add(service)
+    feed = await service.set_embed(SERVER, feed.id, title="{{title}}", actor=ALEX)
+    feed = await service.add_field(SERVER, feed.id, "By", "{{author}}", actor=ALEX)
+
+    feed = await service.remove_field(SERVER, feed.id, 1, actor=ALEX)
+
+    assert feed.embed == EmbedSpec(title="{{title}}")
+
+
+async def test_clearing_what_an_embed_shows_removes_it(service: FeedService) -> None:
+    # Nothing to show is posted as no Embed, so it is stored as none (as with the last Field).
+    feed = await add(service)
+    feed = await service.set_embed(SERVER, feed.id, title="{{title}}", colour="#ff8800", actor=ALEX)
+    assert feed.embed is not None
+
+    feed = await service.set_embed(SERVER, feed.id, title="", actor=ALEX)
+
+    assert feed.embed is None
+    assert service.get_feed(SERVER, feed.id).embed is None
+
+
+async def test_an_embed_with_only_a_link_colour_or_timestamp_is_not_stored(
+    service: FeedService,
+) -> None:
+    feed = await add(service)
+    for part in ({"url": "{{link}}"}, {"colour": "#ff8800"}, {"timestamp": False}):
+        assert (await service.set_embed(SERVER, feed.id, actor=ALEX, **part)).embed is None  # type: ignore[arg-type]
+
+
+async def test_an_embed_that_stays_none_is_not_logged(
+    service: FeedService, journal: Journal, db: Database
+) -> None:
+    feed = await add(service)
+    await service.set_embed(SERVER, feed.id, colour="#ff8800", actor=ALEX)
+    await journal.drain()
+    assert not [e for e in db.list_log_entries(SERVER, limit=10) if "Embed" in e.detail]
 
 
 async def test_field_validation(service: FeedService) -> None:
@@ -1301,6 +1439,54 @@ async def test_resume_keeps_the_wait_of_a_rate_limited_feed(
     clock.t = booked + 60
     db.update_feed(feed.id, paused=PauseReason.MANUAL)
     assert (await service.resume_feed(SERVER, feed.id, actor=ALEX)).next_check_at == clock.t
+
+
+async def test_editing_the_interval_keeps_the_wait_of_a_rate_limited_feed(
+    service: FeedService, db: Database, clock: FakeClock
+) -> None:
+    feed = await add(service, interval_s=3600)
+    booked = clock.t + 6 * 3600
+    db.update_feed(feed.id, rate_limited_since=clock.t, next_check_at=booked)
+
+    edited, _ = await service.edit_feed(SERVER, feed.id, interval_s=300, actor=ALEX)
+
+    assert (edited.interval_s, edited.next_check_at) == (300, booked)
+    assert edited.rate_limited_since == clock.t
+
+    # Not rate-limited, a shorter interval still brings the next Check forward.
+    db.update_feed(feed.id, rate_limited_since=None, next_check_at=booked)
+    edited, _ = await service.edit_feed(SERVER, feed.id, interval_s=600, actor=ALEX)
+    assert edited.next_check_at == clock.t + 600
+
+
+async def test_moving_a_feed_out_of_a_lost_channel_keeps_the_wait_of_a_rate_limited_feed(
+    service: FeedService, db: Database, clock: FakeClock
+) -> None:
+    feed = await add(service)
+    booked = clock.t + 7200
+    db.update_feed(
+        feed.id, paused=PauseReason.LOST_CHANNEL, rate_limited_since=clock.t, next_check_at=booked
+    )
+
+    moved, _ = await service.edit_feed(
+        SERVER, feed.id, channel_id=OTHER_CHANNEL, channel_kind=MESSAGES, actor=ALEX
+    )
+
+    assert (moved.paused, moved.next_check_at) == (None, booked)
+
+
+async def test_tagging_a_feed_keeps_the_wait_of_a_rate_limited_feed(
+    service: FeedService, db: Database, clock: FakeClock
+) -> None:
+    feed = await add(service, channel_kind=FORUM)
+    booked = clock.t + 7200
+    db.update_feed(
+        feed.id, paused=PauseReason.NEEDS_TAG, rate_limited_since=clock.t, next_check_at=booked
+    )
+
+    tagged = await service.set_forum_tags(SERVER, feed.id, [9], actor=ALEX)
+
+    assert (tagged.paused, tagged.next_check_at) == (None, booked)
 
 
 async def test_make_due_leaves_rate_limited_feeds_to_wait(
