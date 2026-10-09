@@ -58,13 +58,23 @@ class FakeChannel:
         type: discord.ChannelType = discord.ChannelType.text,
         *,
         bot_can_post: bool = True,
+        lacking: tuple[str, ...] = (),
     ) -> None:
         self.id, self.name, self.type = id, name, type
         self._bot_can_post = bot_can_post
+        self._lacking = lacking  # permissions the bot lacks although it can see and post
 
     def permissions_for(self, member: Any) -> discord.Permissions:
         allowed = self._bot_can_post
-        return discord.Permissions(view_channel=allowed, send_messages=allowed)
+        permissions = discord.Permissions(
+            view_channel=allowed,
+            send_messages=allowed,
+            send_messages_in_threads=allowed,
+            embed_links=allowed,
+        )
+        for name in self._lacking:
+            setattr(permissions, name, False)
+        return permissions
 
 
 class FakeGuild:

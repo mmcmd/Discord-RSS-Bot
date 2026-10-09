@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 from . import template as tpl
 from .db import Database, FeedNotFound
-from .filters import normalise_word
+from .filters import normalise_word, passes
 from .identity import SiteIdentity, discover
 from .journal import Journal
 from .models import (
@@ -379,6 +379,8 @@ class FeedService:
             if feed.post_as is PostAs.SITE:
                 identity = await discover(parsed, new_url, self._fetcher)
             feed = self.get_feed(server_id, feed_id)  # it may have changed meanwhile
+            if channel_id is None:
+                target_channel = feed.channel_id
             self._refuse_duplicate(target_channel, new_url, but=feed.id)
 
         now = self._clock.now()
@@ -439,7 +441,10 @@ class FeedService:
         if feed.paused is PauseReason.MANUAL:
             return feed
         updated = self._update(feed.id, paused=PauseReason.MANUAL)
-        self._log(actor, LogKind.FEED_PAUSED, updated)
+        detail = ""
+        if feed.paused is not None:  # the bot's pause, whose reason the member's replaces
+            detail = f"Replaced the bot's pause: {pause_cause(feed.paused)}."
+        self._log(actor, LogKind.FEED_PAUSED, updated, detail=detail)
         return updated
 
     async def resume_feed(self, server_id: int, feed_id: int, *, actor: Actor) -> Feed:
@@ -480,6 +485,21 @@ class FeedService:
         except Exception as exc:
             log.warning("Feed %s: the preview could not be rendered", feed.id, exc_info=True)
             raise ServiceError("The newest Item could not be made into a message.") from exc
+
+    def held_back(self, server_id: int, feed_id: int, item: Item) -> bool:
+        """Whether the Feed's Filters would stop a Check from posting this Item."""
+        feed = self.get_feed(server_id, feed_id)
+        try:
+            return not passes(item, self._db.list_filters(feed.id))
+        except Exception:
+            # As in a Check: Filters that cannot be applied let the Item through.
+            log.warning("Feed %s: could not apply the Filters to an Item", feed.id, exc_info=True)
+            return False
+
+    async def record_posted(self, server_id: int, feed_id: int, item: Item) -> None:
+        """Record an Item posted outside a Check as delivered, so that no Check posts it again."""
+        feed = self.get_feed(server_id, feed_id)
+        self._db.record_seen(feed.id, [(item.key, ItemStatus.DELIVERED)], self._clock.now())
 
     async def placeholder_values(self, server_id: int, feed_id: int) -> list[tuple[str, str]]:
         """Every Placeholder with its value for the newest Item, cut short.
@@ -941,7 +961,9 @@ class FeedService:
         if result.not_modified:
             raise ServiceError("The Feed could not be fetched.")
         try:
-            parsed = await asyncio.to_thread(self._parse, result.body, result.url or url)
+            parsed = await asyncio.to_thread(
+                self._parse, result.body, result.url or url, result.content_type
+            )
         except ParseError as exc:
             log.info("No feed from %s: %s", _host(url) or "that address", exc)
             raise ServiceError(str(exc) or "That address did not return a feed.") from exc

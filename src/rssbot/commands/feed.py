@@ -44,6 +44,7 @@ from ..service import (
 )
 from . import _history as history
 from . import _ui as ui
+from .template import PREVIEW_REFUSED
 
 MESSAGE_CHANNEL_TYPES = (
     discord.ChannelType.text,
@@ -81,6 +82,10 @@ OUTCOME_WORDS = {
     DeliveryOutcome.RETRY: (
         "Discord did not take the message just now. Nothing was posted in {channel}; "
         "try again in a minute."
+    ),
+    DeliveryOutcome.UNKNOWN: (
+        "Discord did not answer, so the bot cannot tell whether the message was posted in "
+        "{channel}. Check the channel before trying again."
     ),
     DeliveryOutcome.REJECTED: (
         "Discord refused the message, so nothing was posted in {channel}. "
@@ -179,13 +184,22 @@ def _current_channel(interaction: discord.Interaction) -> Any | None:
     return channel
 
 
-def _access_warning(interaction: discord.Interaction, channel_id: int) -> str:
+def _access_warning(
+    interaction: discord.Interaction, channel_id: int, *, embed: bool = False
+) -> str:
     """A warning when the bot cannot post in the channel; nothing when it can or cannot tell."""
-    if ui.bot_can_post(interaction, channel_id) is not False:
+    missing = ui.missing_post_permissions(interaction, channel_id, embed=embed)
+    if not missing:
         return ""
+    mention = ui.channel_mention(channel_id)
+    if "View Channel" in missing or "Send Messages" in missing:
+        return (
+            f"**Warning**: the bot cannot see or post in {mention}. "
+            "Nothing will be posted until the bot is given access to it."
+        )
     return (
-        f"**Warning**: the bot cannot see or post in {ui.channel_mention(channel_id)}. "
-        "Nothing will be posted until the bot is given access to it."
+        f"**Warning**: the bot lacks the {' and '.join(missing)} permission in {mention}. "
+        "Posts there may fail until the bot is given it."
     )
 
 
@@ -272,7 +286,7 @@ async def _panel(interaction: discord.Interaction, feed: Feed) -> tuple[str, dis
             f"**Tags**: {len(feed.forum_tag_ids)} · "
             f"**Cover image**: {'on' if feed.forum_cover else 'off'}"
         )
-    warning = _access_warning(interaction, feed.channel_id)
+    warning = _access_warning(interaction, feed.channel_id, embed=feed.embed is not None)
     if warning:
         lines.append(warning)
     pause_or_resume = (
@@ -702,10 +716,15 @@ def _thread_title(message: OutgoingMessage) -> str:
 async def _send_preview(interaction: discord.Interaction, feed: Feed) -> None:
     """Show privately what the Feed would post for the newest Item, then offer to post it."""
     await ui.defer(interaction)
-    message, _ = await _service(interaction).preview(feed.server_id, feed.id)
+    service = _service(interaction)
+    message, item = await service.preview(feed.server_id, feed.id)
     embed = build_embed(message.embed, published=message.published)
     content = message.content or (None if embed is not None else "*(no message text)*")
-    await ui.reply(interaction, content, embed=embed, view=build_view(message))
+    try:
+        await ui.reply(interaction, content, embed=embed, view=build_view(message))
+    except discord.HTTPException:
+        await ui.reply(interaction, PREVIEW_REFUSED, view=ui.view_of(BackToPanel(feed.id)))
+        return
 
     channel = ui.channel_mention(feed.channel_id)
     lines = [
@@ -717,6 +736,8 @@ async def _send_preview(interaction: discord.Interaction, feed: Feed) -> None:
         lines.append(f"**Forum post title**: {title}")
         if message.cover_image_url:
             lines.append(f"**Cover image**: <{ui.cut(message.cover_image_url, 300)}>")
+    if service.held_back(feed.server_id, feed.id, item):
+        lines.append("The Feed's Filters would hold this Item back: a Check would not post it.")
     if message.username:
         lines.append(f"**Post as**: {discord.utils.escape_markdown(message.username)}")
     if feed.mention_role_ids:
@@ -741,8 +762,10 @@ class PostPreview(ui.ActionButton, action="feed_post", ids=1, requires=Level.MAN
         feed = ui.feed_of(interaction, self.ids[0])
         await ui.defer(interaction, update=True)
         shared = ui.deps(interaction)
-        message, _ = await shared.service.preview(feed.server_id, feed.id)
+        message, item = await shared.service.preview(feed.server_id, feed.id)
         outcome = await shared.deliverer.deliver(feed, message)
+        if outcome is DeliveryOutcome.DELIVERED:  # no Check should post it again
+            await shared.service.record_posted(feed.server_id, feed.id, item)
         words = OUTCOME_WORDS.get(outcome, OUTCOME_WORDS[DeliveryOutcome.RETRY])
         content = words.format(channel=ui.channel_mention(feed.channel_id))
         if outcome is DeliveryOutcome.DELIVERED:
@@ -1245,12 +1268,16 @@ async def pause_command(interaction: discord.Interaction, feed: str) -> None:
 async def resume_command(interaction: discord.Interaction, feed: str) -> None:
     ui.require_manager(interaction)
     found = ui.feed_from_option(interaction, feed)
+    if found.paused is None:
+        raise ui.UserError("That Feed is not paused.")
     resumed = await _service(interaction).resume_feed(
         found.server_id, found.id, actor=ui.actor_of(interaction)
     )
     lines = [f"Resumed the Feed **{_name(resumed)}**. It is checked again from now on."]
     if found.paused is PauseReason.LOST_CHANNEL:
-        lines.append(_access_warning(interaction, resumed.channel_id))
+        lines.append(
+            _access_warning(interaction, resumed.channel_id, embed=resumed.embed is not None)
+        )
     elif _needs_tag_again(found.paused, resumed):
         lines.append(TAG_NEEDED_AGAIN)
     await ui.reply(interaction, "\n".join(filter(None, lines)))

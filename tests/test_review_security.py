@@ -290,7 +290,7 @@ async def test_a_server_cannot_have_feeds_without_limit() -> None:
         OneBody(b"x"),  # type: ignore[arg-type]
         clock,
         Journal(db, clock),
-        parse=lambda body, url: parsed,
+        parse=lambda body, url, content_type="": parsed,
     )
 
     with pytest.raises(ServiceError):
@@ -380,7 +380,7 @@ async def test_a_logs_note_does_not_render_markdown_from_the_feed_name() -> None
         Recorder(DeliveryOutcome.LOST_CHANNEL),
         Journal(db, clock, notes),
         clock,
-        lambda body, url: parsed,
+        lambda body, url, content_type="": parsed,
         render_item,
         render_default,
     )

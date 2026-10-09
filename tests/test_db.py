@@ -700,6 +700,31 @@ def test_record_seen_is_all_or_nothing(db: Database) -> None:
     assert db.has_seen_items(feed.id)
 
 
+def test_channels_with_unused_webhook_are_those_without_a_feed(db: Database) -> None:
+    used = make_feed(db, server_id=1, channel_id=10)
+    db.set_webhook(used.channel_id, 1, "a")
+    db.set_webhook(20, 2, "b")
+    db.set_webhook(30, 3, "c")
+    assert db.channels_with_unused_webhook() == [20, 30]
+    db.delete_feed(used.id)
+    assert db.channels_with_unused_webhook() == [10, 20, 30]
+
+
+def test_purging_a_server_also_drops_webhooks_of_channels_with_no_feed(db: Database) -> None:
+    gone = make_feed(db, server_id=1, channel_id=10)
+    live = make_feed(db, server_id=2, channel_id=20)
+    db.set_webhook(gone.channel_id, 1, "a")
+    db.set_webhook(live.channel_id, 2, "b")
+    db.set_webhook(99, 3, "orphan")  # its Feed was removed earlier
+    db.mark_server_removed(1, 50)
+
+    assert db.purge_removed_servers(before=100) == [1]
+
+    assert db.get_webhook(10) is None
+    assert db.get_webhook(99) is None
+    assert db.get_webhook(20) == (2, "b")
+
+
 # -- Webhooks --
 
 
@@ -1048,3 +1073,34 @@ def test_a_version_3_database_gains_log_entries(tmp_path: Path, monkeypatch) -> 
         ]
     finally:
         database.close()
+
+
+class _CommitFails:
+    """A connection whose COMMIT raises, as a full disk or a lock timeout would."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+        if sql == "COMMIT":
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+def test_a_failed_commit_leaves_no_transaction_open(db: Database) -> None:
+    real = db._conn
+    db._conn = _CommitFails(real)  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError), db._transaction():
+        pass
+    assert not real.in_transaction
+
+
+def test_delete_webhook_only_when_the_stored_id_matches(db: Database) -> None:
+    db.set_webhook(CHANNEL, 5, "tok")
+    assert db.delete_webhook(CHANNEL, webhook_id=6) is False
+    assert db.get_webhook(CHANNEL) == (5, "tok")
+    assert db.delete_webhook(CHANNEL, webhook_id=5) is True
+    assert db.get_webhook(CHANNEL) is None

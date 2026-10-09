@@ -116,6 +116,8 @@ class Web:
         self.unparsable: dict[str, Exception] = {}  # address -> what the parser raises
         self.pages: dict[str, bytes] = {}  # home pages
         self.calls: list[tuple[str, str | None]] = []
+        self.served_type = ""  # the Content-Type every fetch reports
+        self.parsed_types: list[str] = []  # the Content-Type each parse was handed
         self.in_flight = 0
         self.most_in_flight = 0
 
@@ -140,14 +142,17 @@ class Web:
                 raise FetchError("The address answered with error 404.")
             if etag is not None and etag == self._etag(url):
                 return FetchResult(True, b"", etag, None, url)
-            return FetchResult(False, url.encode(), self._etag(url), "yesterday", url)
+            return FetchResult(
+                False, url.encode(), self._etag(url), "yesterday", url, self.served_type
+            )
         finally:
             self.in_flight -= 1
 
     async def fetch_image(self, url: str, *, max_bytes: int = 0) -> ImageData:
         raise FetchError("no images here")
 
-    def parse(self, body: bytes, url: str) -> ParsedFeed:
+    def parse(self, body: bytes, url: str, content_type: str = "") -> ParsedFeed:
+        self.parsed_types.append(content_type)
         if url in self.unparsable:
             raise self.unparsable[url]
         return self.listings[body.decode()]
@@ -330,6 +335,17 @@ async def test_no_log_line_carries_the_private_key_of_an_address(
     assert "Could not parse example.com" in caplog.text
     assert "OPML import: could not add odd.example" in caplog.text
     assert "SECRET" not in caplog.text
+
+
+async def test_add_hands_the_served_content_type_to_the_parser(
+    service: FeedService, web: Web
+) -> None:
+    web.listings[URL] = listing("a")
+    web.served_type = "application/rss+xml; charset=koi8-r"
+
+    await add(service)
+
+    assert web.parsed_types == ["application/rss+xml; charset=koi8-r"]
 
 
 async def test_add_puts_https_before_a_bare_address(service: FeedService, web: Web) -> None:
@@ -517,6 +533,8 @@ OPERATIONS: dict[str, Call] = {
     "resume_feed": lambda s, server, feed: s.resume_feed(server, feed, actor=ALEX),
     "preview": lambda s, server, feed: s.preview(server, feed),
     "placeholder_values": lambda s, server, feed: s.placeholder_values(server, feed),
+    "held_back": lambda s, server, feed: s.held_back(server, feed, item("a")),
+    "record_posted": lambda s, server, feed: s.record_posted(server, feed, item("a")),
     "set_text": lambda s, server, feed: s.set_text(server, feed, "x", actor=ALEX),
     "set_embed": lambda s, server, feed: s.set_embed(server, feed, title="x", actor=ALEX),
     "remove_embed": lambda s, server, feed: s.remove_embed(server, feed, actor=ALEX),
@@ -611,6 +629,33 @@ async def test_preview_without_dates_takes_the_first_listed(service: FeedService
     feed = await add(service)
     _, newest = await service.preview(SERVER, feed.id)
     assert newest.key == "a"
+
+
+async def test_a_previewed_item_recorded_as_posted_is_not_posted_by_the_next_check(
+    service: FeedService, db: Database, web: Web, clock: FakeClock
+) -> None:
+    feed = await add(service)
+    web.listings[URL] = listing("new", "a", "b", "c")
+    _, newest = await service.preview(SERVER, feed.id)
+    assert newest.key == "new"
+    await service.record_posted(SERVER, feed.id, newest)
+
+    posts = Posts()
+    clock.t += feed.interval_s + 1
+    await scheduler(db, web, clock, posts).tick()
+    assert posts.sent == []
+
+
+async def test_held_back_says_whether_the_filters_would_stop_the_item(
+    service: FeedService,
+) -> None:
+    feed = await add(service)
+    _, newest = await service.preview(SERVER, feed.id)
+    assert service.held_back(SERVER, feed.id, newest) is False
+    await service.add_filters(
+        SERVER, feed.id, FilterList.BLOCK, FilterField.TITLE, [newest.title], actor=ALEX
+    )
+    assert service.held_back(SERVER, feed.id, newest) is True
 
 
 async def test_preview_errors(service: FeedService, web: Web) -> None:
@@ -711,6 +756,23 @@ async def test_edit_url_is_refused_when_it_cannot_be_read(
     web.unparsable[URL2] = ParseError("Not a feed.")
     assert await error(service.edit_feed(SERVER, feed.id, url=URL2, actor=ALEX)) == "Not a feed."
     assert db.get_feed(feed.id) == feed
+
+
+async def test_edit_url_only_keeps_a_channel_moved_meanwhile(
+    service: FeedService, db: Database, web: Web
+) -> None:
+    feed = await add(service)
+    real_fetch = web.fetch
+
+    async def fetch_while_moved(url: str, **kwargs: Any) -> FetchResult:
+        if url == URL2:  # another edit moves the Feed while this one reads the new address
+            db.update_feed(feed.id, channel_id=OTHER_CHANNEL, channel_kind=FORUM)
+        return await real_fetch(url, **kwargs)
+
+    web.fetch = fetch_while_moved  # type: ignore[method-assign]
+    edited, old_channel = await service.edit_feed(SERVER, feed.id, url=URL2, actor=ALEX)
+    assert old_channel is None
+    assert (edited.url, edited.channel_id, edited.channel_kind) == (URL2, OTHER_CHANNEL, FORUM)
 
 
 async def test_edit_url_resets_and_rebaselines(
@@ -1896,3 +1958,27 @@ async def test_a_log_entry_that_cannot_be_saved_does_not_fail_what_was_done(
     await journal.drain()
     assert (logged(db), reports.sent) == ([], [])
     assert caplog.text.count("its Log entry could not be saved") == 5
+
+
+@pytest.mark.parametrize(
+    ("reason", "words"),
+    [
+        (PauseReason.LOST_CHANNEL, "the bot can no longer post in its channel"),
+        (PauseReason.NEEDS_TAG, "the forum requires a tag and the Feed has none"),
+    ],
+)
+async def test_a_member_pausing_a_feed_the_bot_paused_says_so_in_the_history(
+    service: FeedService, db: Database, journal: Journal, reason: PauseReason, words: str
+) -> None:
+    feed = await add(service)
+    paused_by_bot = db.update_feed(feed.id, paused=reason)
+    journal.record_feed(
+        Actor.bot(), LogKind.FEED_AUTO_PAUSED, paused_by_bot, detail=f"Bot reason: {words}."
+    )
+    await service.pause_feed(SERVER, feed.id, actor=SAM)
+    _, bot_entry, member_entry = logged(db)
+    assert (bot_entry.kind, bot_entry.actor_id) == (LogKind.FEED_AUTO_PAUSED, None)
+    assert words in bot_entry.detail
+    assert (member_entry.kind, by(member_entry)) == (LogKind.FEED_PAUSED, (SAM.id, "Sam"))
+    assert "Replaced the bot's pause" in member_entry.detail
+    assert words in member_entry.detail

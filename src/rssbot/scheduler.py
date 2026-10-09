@@ -82,6 +82,10 @@ class SystemClock:
         await asyncio.sleep(seconds)
 
 
+class _FeedChanged(Exception):
+    """The Feed was deleted, paused or moved while its Items were being posted."""
+
+
 class _CheckFailed(Exception):
     """A Check failed for a reason a Manager can be told. The message becomes last_error."""
 
@@ -292,7 +296,20 @@ class Scheduler:
 
     async def _drain(self, queue: Iterator[int]) -> None:
         for feed_id in queue:
-            await self.check_feed(feed_id)
+            if self._still_due(feed_id):
+                await self.check_feed(feed_id)
+
+    def _still_due(self, feed_id: int) -> bool:
+        """Whether the Feed still wants a Check when its turn comes.
+
+        The pass listed it some time ago. A Refresh may have checked it since, and it would
+        be fetched a second time for nothing.
+        """
+        try:
+            feed = self._db.get_feed(feed_id)
+            return feed is not None and feed.next_check_at <= self._clock.now()
+        except Exception:
+            return True  # _check looks again, and deals with whatever is wrong
 
     def _housekeeping(self) -> None:
         try:
@@ -359,7 +376,7 @@ class Scheduler:
             await self._failed(feed, "The Check was interrupted.")
         elif (error := work.exception()) is None:
             outcome = work.result()
-            await self._settle(feed, outcome)
+            await self._settle(feed, outcome, booked)
             self._log_check(feed, outcome, round((loop.time() - started) * 1000))
         elif isinstance(error, _CheckFailed) and error.slow_down:
             self._slowed(feed, error.wait_s)
@@ -422,16 +439,21 @@ class Scheduler:
                 result.last_modified or feed.last_modified,
                 not_modified=True,
             )
-        parsed = await self._parse_in_thread(feed.id, result.body, result.url or feed.url)
+        parsed = await self._parse_in_thread(
+            feed.id, result.body, result.url or feed.url, result.content_type
+        )
 
         # The fetch may have taken a while. Post with the Feed as it is now, if it still
         # wants these Items at all.
         current = self._db.get_feed(feed.id)
-        if current is None or current.paused is not None or current.url != feed.url:
+        if not self._unchanged(current, feed) or current.paused is not None:
             return None
         tally = _Tally()
         queue = await self._with_covers(self._plan(current, parsed.items, tally))
-        pause, unfinished = await self._post(current, queue, deadline, tally)
+        try:
+            pause, unfinished = await self._post(current, queue, deadline, tally)
+        except _FeedChanged:
+            return None
         return _Outcome(
             current,
             # An Item left to be tried again is only seen again if the source is read in
@@ -468,8 +490,10 @@ class Scheduler:
 
         return list(await asyncio.gather(*(cover(item) for item in queue)))
 
-    async def _parse_in_thread(self, feed_id: int, body: bytes, url: str) -> ParsedFeed:
-        job = asyncio.ensure_future(asyncio.to_thread(self._parse, body, url))
+    async def _parse_in_thread(
+        self, feed_id: int, body: bytes, url: str, content_type: str
+    ) -> ParsedFeed:
+        job = asyncio.ensure_future(asyncio.to_thread(self._parse, body, url, content_type))
         job.add_done_callback(_retrieve)
         try:
             return await asyncio.shield(job)
@@ -588,9 +612,14 @@ class Scheduler:
                     len(queue) - started,
                 )
                 return None, True
+            if started and not self._wants_posts(feed):
+                log.info("check.feed_changed feed=%s name=%s", feed.id, quote(feed.name))
+                raise _FeedChanged
             try:
                 result = await self._post_item(feed, item, tally)
             except Exception:
+                if self._deleted(feed):
+                    raise _FeedChanged from None  # its Items cannot be recorded: not a fault
                 # Boundary: the guard around one Item. Whatever went wrong with it, in the
                 # renderer, the deliverer or the database, the next Item still gets its
                 # turn. Nothing is recorded here. An Item that could not be recorded at
@@ -611,6 +640,36 @@ class Scheduler:
                 return result, True
             unfinished = unfinished or result is ItemStatus.PENDING
         return None, unfinished
+
+    def _deleted(self, feed: Feed) -> bool:
+        try:
+            return self._db.get_feed(feed.id) is None
+        except Exception:
+            return False
+
+    def _wants_posts(self, feed: Feed) -> bool:
+        """Whether the Feed still exists, is not paused and posts where it did.
+
+        Looked at between Items: a Manager may pause, move or delete the Feed during a long
+        Check, and the Items left would go to the old channel or fail one by one.
+        """
+        try:
+            current = self._db.get_feed(feed.id)
+        except Exception:
+            return True  # not knowing is no reason to stop; the Item's own guard deals with it
+        return current is not None and current.paused is None and self._unchanged(current, feed)
+
+    @staticmethod
+    def _unchanged(current: Feed | None, feed: Feed) -> bool:
+        """Whether `current` is the same Feed as `feed` was: it still has its address and channel.
+
+        Anything a Check found out about another address or channel says nothing about this one.
+        """
+        return (
+            current is not None
+            and current.url == feed.url
+            and current.channel_id == feed.channel_id
+        )
 
     async def _post_item(self, feed: Feed, item: Item, tally: _Tally) -> ItemStatus | PauseReason:
         """Post one Item and record how it went, as soon as that is known."""
@@ -640,6 +699,9 @@ class Scheduler:
             return self._give_up(
                 feed, item, "it could not be made into a message Discord takes", tally
             )
+        if outcome is DeliveryOutcome.UNKNOWN:
+            # No answer from Discord: it may have the message. As with a cut-off (docs/adr/0003).
+            return self._give_up(feed, item, "its delivery was cut off", tally)
         pauses = outcome in (DeliveryOutcome.LOST_CHANNEL, DeliveryOutcome.NEEDS_TAG)
         if not pauses and attempts >= MAX_DELIVERY_ATTEMPTS:
             return self._give_up(feed, item, f"its delivery failed {attempts} times", tally)
@@ -668,6 +730,10 @@ class Scheduler:
         message = self._rendered(self._render_default, feed, item)
         if message is None:
             return DeliveryOutcome.REJECTED
+        if refused and message.cover_image_url is not None:
+            # The Cover image was already downloaded, or failed to be, by the first attempt.
+            # Downloading it again could take more than the Item's allowance has left.
+            message = dataclasses.replace(message, cover_image_url=None)
         outcome = await self._deliver(feed, message)
         if refused and outcome is DeliveryOutcome.RETRY:
             return DeliveryOutcome.REJECTED  # the default rendering gets one try, not three
@@ -736,17 +802,31 @@ class Scheduler:
 
     # -- after the Check --
 
-    async def _settle(self, feed: Feed, outcome: _Outcome | None) -> None:
+    async def _settle(self, feed: Feed, outcome: _Outcome | None, booked: int) -> None:
         if outcome is None:
-            # As if this Check had not been started.
-            self._save(feed.id, next_check_at=feed.next_check_at)
+            # As if this Check had not been started, unless somebody has set the time since.
+            current = self._db.get_feed(feed.id)
+            if current is not None and current.next_check_at == booked:
+                self._save(feed.id, next_check_at=feed.next_check_at)
         elif outcome.pause is not None:
             await self._paused(outcome.feed, outcome.pause, feed.next_check_at)
         else:
             await self._succeeded(outcome)
 
+    def _current(self, feed: Feed) -> Feed | None:
+        """The Feed as it is stored now, or None if there is nothing to write to.
+
+        A Check works on a Feed it read earlier. If the Feed was deleted since, or has been
+        pointed at another address or moved to another channel, what the Check found out is
+        about something else: it is dropped, and the schedule the change gave the Feed stays.
+        """
+        current = self._db.get_feed(feed.id)
+        return current if self._unchanged(current, feed) else None
+
     async def _succeeded(self, outcome: _Outcome) -> None:
-        feed = outcome.feed
+        feed = self._current(outcome.feed)
+        if feed is None:
+            return
         now = self._clock.now()
         changes: dict[str, Any] = {
             "etag": outcome.etag,
@@ -779,6 +859,10 @@ class Scheduler:
         and its failure count stays as it is. The next Check comes when the source said, or
         after the Feed's interval if it did not say.
         """
+        current = self._current(feed)
+        if current is None:
+            return
+        feed = current
         delay = max(wait_s, SLOW_DOWN_MIN_S) if wait_s > 0 else feed.interval_s
         now = self._clock.now()
         since = now if feed.rate_limited_since is None else feed.rate_limited_since
@@ -807,6 +891,10 @@ class Scheduler:
         booked sooner than that, however short the backoff.
         """
         error = _short(error)
+        current = self._current(feed)
+        if current is None:
+            return
+        feed = current
         now = self._clock.now()
         count = feed.fail_count + 1
         since = now if feed.failing_since is None else feed.failing_since
@@ -841,6 +929,9 @@ class Scheduler:
             )
 
     async def _paused(self, feed: Feed, reason: PauseReason, due: int) -> None:
+        current = self._current(feed)
+        if current is None or current.paused is not None:
+            return  # moved, or already paused by somebody: that stays as it is
         # The Feed keeps the time it was due, so it is checked as soon as it is resumed.
         # Nothing else is stored: with the old validators the source is read in full
         # again, and the Items that were not delivered are still there to post.

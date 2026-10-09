@@ -384,7 +384,13 @@ class Database:
         except BaseException:
             self._conn.execute("ROLLBACK")
             raise
-        self._conn.execute("COMMIT")
+        try:
+            self._conn.execute("COMMIT")
+        except BaseException:
+            # A COMMIT that fails can leave the transaction open, and with it the write lock.
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
 
     def _all(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         # Always drain the cursor: a half-read RETURNING statement would keep its write open.
@@ -453,6 +459,11 @@ class Database:
             rows = self._all(
                 "DELETE FROM servers WHERE removed_at < ? RETURNING server_id", (before,)
             )
+            if rows:
+                # Also those left behind by a channel whose last Feed was removed earlier.
+                self._conn.execute(
+                    "DELETE FROM webhooks WHERE channel_id NOT IN (SELECT channel_id FROM feeds)"
+                )
         return sorted(row["server_id"] for row in rows)
 
     # -- Grants --
@@ -735,9 +746,28 @@ class Database:
             (channel_id, webhook_id, token),
         )
 
-    def delete_webhook(self, channel_id: int) -> bool:
-        """Returns whether there was a webhook to delete."""
-        return bool(self._changed("DELETE FROM webhooks WHERE channel_id = ?", (channel_id,)))
+    def channels_with_unused_webhook(self) -> list[int]:
+        """The channels that have a stored webhook and no Feed."""
+        rows = self._all(
+            "SELECT channel_id FROM webhooks "
+            "WHERE channel_id NOT IN (SELECT channel_id FROM feeds) ORDER BY channel_id"
+        )
+        return [row["channel_id"] for row in rows]
+
+    def delete_webhook(self, channel_id: int, webhook_id: int | None = None) -> bool:
+        """Returns whether there was a webhook to delete.
+
+        With `webhook_id`, only that webhook is deleted: the channel may meanwhile have been
+        given a new one, which must stay.
+        """
+        if webhook_id is None:
+            return bool(self._changed("DELETE FROM webhooks WHERE channel_id = ?", (channel_id,)))
+        return bool(
+            self._changed(
+                "DELETE FROM webhooks WHERE channel_id = ? AND webhook_id = ?",
+                (channel_id, webhook_id),
+            )
+        )
 
     # -- Log entries --
 

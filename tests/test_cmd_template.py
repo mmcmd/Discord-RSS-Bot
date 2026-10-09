@@ -86,7 +86,7 @@ class Web:
     async def fetch_image(self, url: str, *, max_bytes: int = 0) -> ImageData:
         raise FetchError("no images here")
 
-    def parse(self, body: bytes, url: str) -> ParsedFeed:
+    def parse(self, body: bytes, url: str, content_type: str = "") -> ParsedFeed:
         return ParsedFeed(
             title="Example News", link="https://example.com/", image="", items=self.items
         )
@@ -300,7 +300,7 @@ async def test_commands_are_refused_for_a_non_manager(
 ) -> None:
     interaction = member(db, service)
     with pytest.raises(ui.UserError, match="Only Managers"):
-        await command.callback(interaction, feed=str(feed.id))
+        await command.callback(interaction, feed=ui.feed_value(feed.id))
     assert interaction.calls == []
 
 
@@ -343,8 +343,9 @@ async def test_controls_are_refused_for_a_non_manager_and_for_another_server(
     spec = EmbedSpec(title="T", fields=(FieldSpec("a", "b"),))
     button = ButtonSpec("Read", "{{link}}")
     feed = make_feed(db, text_template="mine", embed=spec, buttons=(button,))
+    extra = (0,) if control is template.ToggleTimestamp else ()  # the state it sets
     interaction = member(db, service, type=COMPONENT)
-    await click(interaction, control(feed.id), "1")
+    await click(interaction, control(feed.id, *extra), "1")
     assert interaction.calls == [
         (
             "send_message",
@@ -354,7 +355,7 @@ async def test_controls_are_refused_for_a_non_manager_and_for_another_server(
 
     foreign = make_feed(db, OTHER_SERVER, text_template="theirs", embed=spec, buttons=(button,))
     interaction = manager(db, service, type=COMPONENT)
-    await click(interaction, control(foreign.id), "1")
+    await click(interaction, control(foreign.id, *extra), "1")
     assert interaction.last[0] == "send_message"
     assert interaction.text == ui.FEED_GONE
     assert stored(db, feed) == feed
@@ -403,7 +404,7 @@ async def test_forms_are_refused_for_a_non_manager_and_for_another_server(
 async def test_text_command_opens_a_prefilled_form(db: Database, service: FeedService) -> None:
     feed = make_feed(db, text_template="Hello {{title}}")
     interaction = manager(db, service)
-    await template.text_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.text_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     form = form_of(interaction)
     check_form_limits(form)
@@ -614,7 +615,7 @@ EMBED = EmbedSpec(
 async def test_embed_command_opens_a_prefilled_form(db: Database, service: FeedService) -> None:
     feed = make_feed(db, embed=EMBED)
     interaction = manager(db, service)
-    await template.embed_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.embed_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     form = form_of(interaction)
     check_form_limits(form)
@@ -656,7 +657,7 @@ async def test_colour_option_travels_in_the_form_id(
     db: Database, service: FeedService, feed: Feed, option: str | None, code: int
 ) -> None:
     interaction = manager(db, service)
-    await template.embed_command.callback(interaction, feed=str(feed.id), colour=option)  # type: ignore[arg-type]
+    await template.embed_command.callback(interaction, feed=ui.feed_value(feed.id), colour=option)  # type: ignore[arg-type]
     assert form_of(interaction)["custom_id"] == f"rss:m:tpl_embed:{feed.id}:{code}"
     assert stored(db, feed) == feed  # nothing changes until the form is sent
 
@@ -667,7 +668,8 @@ async def test_bad_colour_option_is_refused(
 ) -> None:
     interaction = manager(db, service)
     with pytest.raises(ui.UserError, match="hex code such as #ff8800"):
-        await template.embed_command.callback(interaction, feed=str(feed.id), colour=option)  # type: ignore[arg-type]
+        value = ui.feed_value(feed.id)
+        await template.embed_command.callback(interaction, feed=value, colour=option)  # type: ignore[arg-type]
     assert interaction.calls == []
 
 
@@ -705,7 +707,7 @@ async def test_saving_the_embed_keeps_changes_or_clears_the_colour(
         f"rss:c:tpl_colour:{feed.id}",
         f"rss:c:tpl_embed:{feed.id}:0",
         f"rss:c:tpl_fields:{feed.id}",
-        f"rss:c:tpl_embed_time:{feed.id}",
+        f"rss:c:tpl_embed_time:{feed.id}:0",
         f"rss:c:tpl_embed_remove:{feed.id}",
         f"rss:c:tpl_back:{feed.id}",
     ]
@@ -865,15 +867,20 @@ async def test_timestamp_button_flips_the_post_date_and_says_so(
     assert stored(db, feed).embed.timestamp is True  # on by default
 
     off = manager(db, service, type=COMPONENT)
-    await click(off, template.ToggleTimestamp(feed.id))
+    await click(off, template.ToggleTimestamp(feed.id, 0))
     assert stored(db, feed).embed.timestamp is False
     assert "no longer shows the post date" in off.text
     assert "Append post date to footer (local time): off" in button_labels(off.last[1]["view"])
 
     on = manager(db, service, type=COMPONENT)
-    await click(on, template.ToggleTimestamp(feed.id))
+    await click(on, template.ToggleTimestamp(feed.id, 1))
     assert stored(db, feed).embed.timestamp is True
     assert "Append post date to footer (local time): on" in button_labels(on.last[1]["view"])
+
+    # A click on a message that is out of date sets what its button showed; it never flips.
+    again = manager(db, service, type=COMPONENT)
+    await click(again, template.ToggleTimestamp(feed.id, 1))
+    assert stored(db, feed).embed.timestamp is True
 
 
 async def test_remove_embed_asks_in_place_then_removes(db: Database, service: FeedService) -> None:
@@ -930,7 +937,7 @@ async def test_cancelling_the_removal_returns_to_the_embed_screen(
         f"rss:c:tpl_colour:{feed.id}",
         f"rss:c:tpl_embed:{feed.id}:0",
         f"rss:c:tpl_fields:{feed.id}",
-        f"rss:c:tpl_embed_time:{feed.id}",
+        f"rss:c:tpl_embed_time:{feed.id}:0",
         f"rss:c:tpl_embed_remove:{feed.id}",
         f"rss:c:tpl_back:{feed.id}",
     ]
@@ -958,7 +965,7 @@ async def test_cancelling_the_removal_of_an_embed_already_gone_says_so(
 
 async def test_fields_command_lists_none(db: Database, service: FeedService, feed: Feed) -> None:
     interaction = manager(db, service)
-    await template.fields_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.fields_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     assert interaction.last[0] == "send_message"
     private(interaction)
@@ -1136,7 +1143,7 @@ async def test_field_limit(db: Database, service: FeedService) -> None:
     fields = tuple(FieldSpec(f"name {n} " + "n" * 250, "v" * 1024) for n in range(MAX_EMBED_FIELDS))
     feed = make_feed(db, embed=EmbedSpec(fields=fields))
     interaction = manager(db, service)
-    await template.fields_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.fields_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     sent = interaction.last[1]
     assert len(sent["content"]) <= 2000
@@ -1164,7 +1171,7 @@ async def test_buttons_command_lists_them(db: Database, service: FeedService) ->
     buttons = (ButtonSpec("Read", "{{link}}"), ButtonSpec("Site", "https://example.com/"))
     feed = make_feed(db, buttons=buttons)
     interaction = manager(db, service)
-    await template.buttons_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.buttons_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     private(interaction)
     assert "**Buttons of **News**** (2 of 5)" in interaction.text
@@ -1381,7 +1388,7 @@ async def test_button_limit(db: Database, service: FeedService) -> None:
     assert len(buttons) == MAX_BUTTONS
     feed = make_feed(db, buttons=buttons)
     interaction = manager(db, service)
-    await template.buttons_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.buttons_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     sent = interaction.last[1]
     assert len(sent["content"]) <= 2000
@@ -1406,7 +1413,7 @@ async def test_reset_asks_then_resets(db: Database, service: FeedService) -> Non
         db, text_template="mine", embed=EMBED, buttons=(ButtonSpec("Read", "{{link}}"),)
     )
     interaction = manager(db, service)
-    await template.reset_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.reset_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     assert stored(db, feed) == feed
     private(interaction)
@@ -1441,7 +1448,7 @@ async def test_placeholders_lists_every_value(
     db: Database, service: FeedService, feed: Feed
 ) -> None:
     interaction = manager(db, service)
-    await template.placeholders_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.placeholders_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     assert [name for name, _ in interaction.calls] == ["defer", "followup"]
     private(interaction)
@@ -1485,7 +1492,7 @@ async def test_placeholders_fit_with_huge_values(
     )
     feed = make_feed(db, source_title=huge, source_link="https://example.com/" + "s" * 1500)
     interaction = manager(db, service)
-    await template.placeholders_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.placeholders_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     text = interaction.text
     assert 1900 < len(text) <= 2000
@@ -1503,7 +1510,7 @@ async def test_placeholders_when_the_fetch_fails(
     web.error = FetchError("The address answered with error 500.")
     feed = make_feed(db, name="")
     interaction = manager(db, service)
-    await template.placeholders_command.callback(interaction, feed=str(feed.id))  # type: ignore[arg-type]
+    await template.placeholders_command.callback(interaction, feed=ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     lines = interaction.text.split("\n")
     assert lines[1] == template.NO_ITEM_VALUES

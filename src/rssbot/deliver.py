@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import aiohttp
 import discord
 
 from . import logembed
@@ -72,15 +73,28 @@ class Step(enum.Enum):
 
 
 _CONTENT_STEPS = frozenset({Step.SEND, Step.THREAD_CREATE, Step.WEBHOOK_SEND})
+# Steps that send nothing: whatever goes wrong there, no message can have reached Discord.
+_BEFORE_SENDING = frozenset({Step.CHANNEL_FETCH, Step.WEBHOOK_CREATE})
 
 
 def classify_error(exc: BaseException, step: Step) -> DeliveryOutcome:
-    """Map an error raised at `step` to an outcome. When in doubt, RETRY."""
+    """Map an error raised at `step` to an outcome.
+
+    An answer from Discord says the message was not taken, so it is safe to RETRY. Any other
+    error while a message is being sent (connection lost, timeout) leaves it unknown whether
+    Discord took the message: that is UNKNOWN, and the Item is skipped (docs/adr/0003).
+    """
     if not isinstance(exc, discord.HTTPException):
         # fetch_channel raises InvalidData for a channel of a type that cannot hold messages.
         if isinstance(exc, discord.InvalidData) and step is Step.CHANNEL_FETCH:
             return DeliveryOutcome.LOST_CHANNEL
-        return DeliveryOutcome.RETRY  # rate-limit exhaustion, network, timeout, anything else
+        if step in _BEFORE_SENDING:
+            return DeliveryOutcome.RETRY
+        # RateLimited is raised before the request is made; a failure to connect, before
+        # anything is written to the connection.
+        if isinstance(exc, discord.RateLimited | aiohttp.ClientConnectorError):
+            return DeliveryOutcome.RETRY
+        return DeliveryOutcome.UNKNOWN
 
     status, code = exc.status, exc.code
     if code == TAG_REQUIRED:
@@ -260,8 +274,30 @@ class DiscordDeliverer:
             return await self._deliver(feed, message)
         except Exception:
             # Every expected failure is classified where it happens; this is the safety net.
+            # What failed is not known, so neither is whether anything was sent.
             log.exception("deliver.error feed=%s channel=%s", feed.id, feed.channel_id)
-            return DeliveryOutcome.RETRY
+            return DeliveryOutcome.UNKNOWN
+
+    async def cleanup_unused_webhooks(self) -> None:
+        """Delete the webhooks of channels that have no Feed any more. Never raises.
+
+        Picks up what `cleanup_webhook` left behind when Discord had an error, and the
+        webhooks of channels that were deleted. A webhook a Feed in the channel still uses
+        is never touched.
+        """
+        try:
+            channels = self._db.channels_with_unused_webhook()
+        except Exception:
+            log.exception("Could not list the unused webhooks")
+            return
+        for channel_id in channels:
+            try:
+                if self._db.list_channel_feeds(channel_id):
+                    continue  # a Feed was added since the list was made
+            except Exception:
+                log.exception("Could not check the Feeds of channel %s", channel_id)
+                continue
+            await self.cleanup_webhook(channel_id)
 
     async def cleanup_webhook(self, channel_id: int) -> None:
         """Delete the channel's webhook from Discord and the store. Never raises."""
@@ -426,7 +462,9 @@ class DiscordDeliverer:
                 await webhook.send(wait=True, **kwargs)
             except Exception as exc:
                 if attempt == 0 and webhook_is_gone(exc):
-                    self._db.delete_webhook(feed.channel_id)
+                    # Only the webhook that failed: a concurrent Feed may have stored a new
+                    # one already, and deleting that would orphan it on Discord.
+                    self._db.delete_webhook(feed.channel_id, webhook_id=webhook.id)
                     continue
                 return classify_error(exc, Step.WEBHOOK_SEND)
             finally:

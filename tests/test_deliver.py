@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import aiohttp
 import discord
 import pytest
 
@@ -37,6 +38,7 @@ from rssbot.models import (
 from rssbot.ports import DeliveryOutcome, FetchError, ImageData
 
 DELIVERED = DeliveryOutcome.DELIVERED
+UNKNOWN = DeliveryOutcome.UNKNOWN
 RETRY = DeliveryOutcome.RETRY
 REJECTED = DeliveryOutcome.REJECTED
 LOST = DeliveryOutcome.LOST_CHANNEL
@@ -259,6 +261,10 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
     return World(monkeypatch)
 
 
+CANNOT_CONNECT = aiohttp.ClientConnectorError(
+    SimpleNamespace(ssl=None, host="h", port=1),  # type: ignore[arg-type]
+    OSError(),
+)
 MSG = OutgoingMessage(content="hello")
 AS_SITE = OutgoingMessage(content="hello", username="The Site", avatar_url="https://e.com/a.png")
 
@@ -275,9 +281,19 @@ AS_SITE = OutgoingMessage(content="hello", username="The Site", avatar_url="http
         (http_error(429), Step.SEND, RETRY),
         (http_error(401), Step.SEND, RETRY),
         (discord.RateLimited(60.0), Step.SEND, RETRY),
-        (TimeoutError(), Step.SEND, RETRY),
-        (OSError("network"), Step.THREAD_CREATE, RETRY),
-        (RuntimeError("?"), Step.WEBHOOK_SEND, RETRY),
+        # Not an answer from Discord, after the request may have gone out: ADR 0003.
+        (TimeoutError(), Step.SEND, UNKNOWN),
+        (OSError("network"), Step.THREAD_CREATE, UNKNOWN),
+        (ConnectionResetError(), Step.SEND, UNKNOWN),
+        (aiohttp.ServerDisconnectedError(), Step.SEND, UNKNOWN),
+        (aiohttp.ClientOSError(), Step.WEBHOOK_SEND, UNKNOWN),
+        (RuntimeError("?"), Step.WEBHOOK_SEND, UNKNOWN),
+        (discord.RateLimited(60.0), Step.WEBHOOK_SEND, RETRY),
+        # Provably before anything was sent.
+        (CANNOT_CONNECT, Step.SEND, RETRY),
+        (TimeoutError(), Step.WEBHOOK_CREATE, RETRY),
+        (aiohttp.ServerDisconnectedError(), Step.CHANNEL_FETCH, RETRY),
+        (OSError("network"), Step.WEBHOOK_CREATE, RETRY),
         (ValueError("?"), Step.CHANNEL_FETCH, RETRY),
         (http_error(400, 50035), Step.SEND, REJECTED),
         (http_error(400, 50035), Step.THREAD_CREATE, REJECTED),
@@ -306,7 +322,7 @@ AS_SITE = OutgoingMessage(content="hello", username="The Site", avatar_url="http
         (http_error(400, 160005), Step.SEND, LOST),
         (http_error(403, 160005), Step.WEBHOOK_SEND, LOST),
         (discord.InvalidData("unknown type"), Step.CHANNEL_FETCH, LOST),
-        (discord.InvalidData("unknown type"), Step.SEND, RETRY),
+        (discord.InvalidData("unknown type"), Step.SEND, UNKNOWN),
         (http_error(400, 40067), Step.THREAD_CREATE, NEEDS_TAG),
         (http_error(400, 40067), Step.WEBHOOK_SEND, NEEDS_TAG),
         (http_error(404, 10015), Step.WEBHOOK_SEND, RETRY),
@@ -526,9 +542,9 @@ async def test_kind_mismatch_is_lost(world: World) -> None:
         (http_error(500), RETRY),
         (http_error(429), RETRY),
         (discord.RateLimited(99.0), RETRY),
-        (TimeoutError(), RETRY),
-        (ConnectionResetError(), RETRY),
-        (RuntimeError("boom"), RETRY),
+        (TimeoutError(), UNKNOWN),
+        (ConnectionResetError(), UNKNOWN),
+        (RuntimeError("boom"), UNKNOWN),
         (http_error(400, 50035), REJECTED),
         (http_error(403, 50013), LOST),
         (http_error(403, 50001), LOST),
@@ -603,6 +619,22 @@ async def test_webhook_is_recreated_once_when_gone(world: World, gone: BaseExcep
     assert len(old.sends.calls) == 1 and len(created.sends.calls) == 1
 
 
+async def test_a_webhook_replaced_meanwhile_is_not_deleted(world: World) -> None:
+    world.db.set_webhook(TEXT, 77, "old")
+    world.partials[77] = old = FakeWebhook(77, "old")
+    old.sends.errors.append(http_error(404, 10015))
+    record = old.sends.record
+
+    def replaced_by_another_feed(kwargs: dict[str, Any]) -> None:
+        world.db.set_webhook(TEXT, 88, "new")  # a concurrent Feed already recreated it
+        record(kwargs)
+
+    old.sends.record = replaced_by_another_feed  # type: ignore[method-assign]
+    assert await world.deliverer.deliver(world.feed(), AS_SITE) is DELIVERED
+    assert world.text.created == []  # the other Feed's webhook was used, not orphaned
+    assert world.db.get_webhook(TEXT) == (88, "new")
+
+
 async def test_webhook_gone_twice_is_a_retry(world: World) -> None:
     world.db.set_webhook(TEXT, 77, "old")
     world.partials[77] = old = FakeWebhook(77, "old")
@@ -625,10 +657,10 @@ async def test_webhook_gone_twice_is_a_retry(world: World) -> None:
     [
         (http_error(400, 50035), REJECTED),
         (http_error(500), RETRY),
-        (TimeoutError(), RETRY),
+        (TimeoutError(), UNKNOWN),
         (http_error(404, 10003), LOST),
         (http_error(403), RETRY),
-        (ValueError("no token"), RETRY),
+        (ValueError("no token"), UNKNOWN),
     ],
 )
 async def test_webhook_send_failures(
@@ -795,7 +827,7 @@ async def test_forum_refusing_for_a_missing_tag(world: World) -> None:
         (http_error(403, 50013), LOST),
         (http_error(404, 10003), LOST),
         (http_error(503), RETRY),
-        (OSError(), RETRY),
+        (OSError(), UNKNOWN),
     ],
 )
 async def test_forum_post_failures(
@@ -914,13 +946,13 @@ async def test_deliver_never_raises(world: World) -> None:
     world.client.get_error = None
 
     world.text.sends.errors.append(Boom())
-    assert await deliver(world.feed(), MSG) is RETRY
+    assert await deliver(world.feed(), MSG) is UNKNOWN
 
     world.text.create_errors = [Boom()]
     assert await deliver(world.feed(), AS_SITE) is RETRY
 
     world.forum.posts.errors.append(Boom())
-    assert await deliver(world.forum_feed(), MSG) is RETRY
+    assert await deliver(world.forum_feed(), MSG) is UNKNOWN
 
     world.forum.create_errors = [Boom()]
     assert await deliver(world.forum_feed(), cover_site) is RETRY
@@ -932,12 +964,12 @@ async def test_deliver_never_raises(world: World) -> None:
     world.db.set_webhook(FORUM, 1, "t")
     world.partials[1] = hook = FakeWebhook(1, "t")
     hook.sends.errors.append(Boom())
-    assert await deliver(world.forum_feed(), cover_site) is RETRY
+    assert await deliver(world.forum_feed(), cover_site) is UNKNOWN
 
     world.thread.archived = True
     world.thread.edit_error = Boom()
     world.thread.sends.errors.append(Boom())
-    assert await deliver(world.feed(THREAD), MSG) is RETRY
+    assert await deliver(world.feed(THREAD), MSG) is UNKNOWN
 
     # A message that cannot even be built can never be sent.
     bad = OutgoingMessage(content="x", embed=EmbedSpec(title="T", colour="red"))  # type: ignore[arg-type]
@@ -953,7 +985,7 @@ async def test_deliver_survives_a_broken_database_and_forum(world: World) -> Non
             raise Boom()
 
     world.client.cached[FORUM] = BrokenForum()
-    assert await world.deliverer.deliver(forum_feed, MSG) is RETRY
+    assert await world.deliverer.deliver(forum_feed, MSG) is UNKNOWN  # the safety net
 
     world.db.close()  # every store call now raises
     assert await world.deliverer.deliver(feed, AS_SITE) is RETRY
@@ -995,6 +1027,70 @@ async def test_cleanup_webhook_never_raises(world: World, error: BaseException, 
     hook.delete_error = error
     await world.deliverer.cleanup_webhook(TEXT)
     assert (world.db.get_webhook(TEXT) is not None) is kept
+
+
+async def test_a_cover_send_cut_off_is_not_sent_again_without_the_cover(world: World) -> None:
+    world.forum.posts.errors.append(ConnectionResetError())
+    assert await world.deliverer.deliver(world.forum_feed(), WITH_COVER) is UNKNOWN
+    assert len(world.forum.posts.calls) == 1
+
+
+async def test_cleanup_unused_webhooks_deletes_only_those_of_channels_without_a_feed(
+    world: World,
+) -> None:
+    world.feed(TEXT)
+    for channel, hook_id in ((TEXT, 1), (FORUM, 2), (THREAD, 3)):
+        world.db.set_webhook(channel, hook_id, f"t{hook_id}")
+        world.partials[hook_id] = FakeWebhook(hook_id, f"t{hook_id}")
+    await world.deliverer.cleanup_unused_webhooks()
+    assert not world.partials[1].deleted and world.db.get_webhook(TEXT) == (1, "t1")
+    assert world.partials[2].deleted and world.db.get_webhook(FORUM) is None
+    assert world.partials[3].deleted and world.db.get_webhook(THREAD) is None
+
+
+async def test_cleanup_unused_webhooks_retries_after_a_server_error(world: World) -> None:
+    world.db.set_webhook(FORUM, 2, "t")
+    world.partials[2] = hook = FakeWebhook(2, "t")
+    hook.delete_error = http_error(500)
+    await world.deliverer.cleanup_unused_webhooks()
+    assert world.db.get_webhook(FORUM) == (2, "t")  # kept for the next pass
+
+    hook.delete_error = None
+    await world.deliverer.cleanup_unused_webhooks()
+    assert hook.deleted and world.db.get_webhook(FORUM) is None
+
+
+async def test_cleanup_unused_webhooks_drops_the_row_of_a_webhook_already_gone(
+    world: World,
+) -> None:
+    world.db.set_webhook(FORUM, 2, "t")
+    world.partials[2] = hook = FakeWebhook(2, "t")
+    hook.delete_error = http_error(404, 10015)
+    await world.deliverer.cleanup_unused_webhooks()
+    assert world.db.get_webhook(FORUM) is None
+
+
+async def test_cleanup_unused_webhooks_skips_a_channel_that_got_a_feed_meanwhile(
+    world: World,
+) -> None:
+    world.db.set_webhook(FORUM, 2, "t")
+    world.partials[2] = hook = FakeWebhook(2, "t")
+
+    original = world.db.channels_with_unused_webhook
+
+    def listed() -> list[int]:
+        channels = original()
+        world.forum_feed()  # a Feed is added right after the list was made
+        return channels
+
+    world.db.channels_with_unused_webhook = listed  # type: ignore[method-assign]
+    await world.deliverer.cleanup_unused_webhooks()
+    assert not hook.deleted and world.db.get_webhook(FORUM) == (2, "t")
+
+
+async def test_cleanup_unused_webhooks_never_raises(world: World) -> None:
+    world.db.close()
+    await world.deliverer.cleanup_unused_webhooks()
 
 
 # -- the notifier --

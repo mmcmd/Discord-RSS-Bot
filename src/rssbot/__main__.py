@@ -24,11 +24,12 @@ from .models import PostAs
 from .parse import parse_feed
 from .render import render_default, render_item
 from .scheduler import Scheduler, SystemClock
-from .service import FeedService
+from .service import NO_SUCH_FEED, FeedService, ServiceError
 
 log = logging.getLogger("rssbot")
 
 IDENTITY_REFRESH_EVERY_S = 24 * 60 * 60
+WEBHOOK_CLEANUP_EVERY_S = 6 * 60 * 60
 
 
 class Bot(discord.Client):
@@ -42,6 +43,11 @@ class Bot(discord.Client):
             chunk_guilds_at_startup=False,
             member_cache_flags=discord.MemberCacheFlags.none(),
             allowed_mentions=discord.AllowedMentions.none(),
+            # A 429 that asks for a longer wait raises RateLimited (a retry on the next Check)
+            # instead of sleeping past the Item's allowance. discord.py's lowest value is 30 s.
+            # Webhook sends are not covered: Webhook.partial sleeps through a 429 itself, and
+            # cutting that short could post twice (docs/adr/0003).
+            max_ratelimit_timeout=30.0,
         )
         self.config = config
         self.tree = app_commands.CommandTree(self)
@@ -80,6 +86,7 @@ class Bot(discord.Client):
             log.exception("Could not register the slash commands with Discord")
         self._tasks.append(asyncio.create_task(self._run_when_ready(), name="check-loop"))
         self._tasks.append(asyncio.create_task(self._refresh_identities(), name="site-identity"))
+        self._tasks.append(asyncio.create_task(self._clean_webhooks(), name="webhook-cleanup"))
 
     async def _run_when_ready(self) -> None:
         # Checks need the channel cache, which is only filled once Discord reports ready.
@@ -103,11 +110,34 @@ class Bot(discord.Client):
                         await self.service.refresh_site_identity(guild.id, feed.id)
                     except asyncio.CancelledError:
                         raise
+                    except ServiceError as exc:
+                        if str(exc) != NO_SUCH_FEED:  # removed meanwhile: nothing to update
+                            log.exception(
+                                "Could not update the Post as name and picture of Feed %s",
+                                feed.id,
+                            )
                     except Exception:
                         log.exception(
                             "Could not update the Post as name and picture of Feed %s", feed.id
                         )
             await asyncio.sleep(IDENTITY_REFRESH_EVERY_S)
+
+    async def _clean_webhooks(self) -> None:
+        """Delete the webhooks no Feed needs, retrying those Discord failed to delete."""
+        await self.wait_until_ready()
+        while True:
+            await self.deliverer.cleanup_unused_webhooks()
+            await asyncio.sleep(WEBHOOK_CLEANUP_EVERY_S)
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        # Its Feeds are left alone: their next Check meets the missing channel and pauses
+        # them as for any lost channel. Only the webhooks are cleaned up here.
+        for gone in (channel, *getattr(channel, "threads", ())):
+            await self.deliverer.cleanup_webhook(gone.id)
+
+    async def on_thread_delete(self, thread: discord.Thread) -> None:
+        # A thread's webhook lives in its parent channel, which survives.
+        await self.deliverer.cleanup_webhook(thread.id)
 
     async def on_ready(self) -> None:
         present = {guild.id for guild in self.guilds}

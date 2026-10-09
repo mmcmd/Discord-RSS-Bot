@@ -390,14 +390,42 @@ def cached_channel(interaction: discord.Interaction, channel_id: int) -> Any | N
     return guild.get_channel_or_thread(channel_id) if guild is not None else None
 
 
-def bot_can_post(interaction: discord.Interaction, channel_id: int) -> bool | None:
-    """Whether the bot can see and post in a channel; None when the cache cannot tell."""
+THREAD_TYPES = (
+    discord.ChannelType.public_thread,
+    discord.ChannelType.private_thread,
+    discord.ChannelType.news_thread,
+)
+
+
+def missing_post_permissions(
+    interaction: discord.Interaction, channel_id: int, *, embed: bool = False
+) -> list[str] | None:
+    """The permissions the bot lacks to post in a channel, by name; None when the cache cannot tell.
+
+    A thread also needs Send Messages in Threads, and an Embed needs Embed Links.
+    """
     guild = interaction.guild
     channel = cached_channel(interaction, channel_id)
     if guild is None or channel is None or guild.me is None:
         return None
     permissions = channel.permissions_for(guild.me)
-    return bool(permissions.view_channel and permissions.send_messages)
+    needed = [
+        ("View Channel", permissions.view_channel),
+        ("Send Messages", permissions.send_messages),
+    ]
+    if getattr(channel, "type", None) in THREAD_TYPES:
+        needed.append(("Send Messages in Threads", permissions.send_messages_in_threads))
+    if embed:
+        needed.append(("Embed Links", permissions.embed_links))
+    return [name for name, granted in needed if not granted]
+
+
+def bot_can_post(
+    interaction: discord.Interaction, channel_id: int, *, embed: bool = False
+) -> bool | None:
+    """Whether the bot can see and post in a channel; None when the cache cannot tell."""
+    missing = missing_post_permissions(interaction, channel_id, embed=embed)
+    return None if missing is None else not missing
 
 
 # -- Members named in Log entries --
@@ -921,7 +949,7 @@ def _feed_choices(
 ) -> list[app_commands.Choice[str]]:
     details = feed_details(interaction, feeds)
     return [
-        app_commands.Choice(name=_feed_label(interaction, feed, detail), value=str(feed.id))
+        app_commands.Choice(name=_feed_label(interaction, feed, detail), value=feed_value(feed.id))
         for feed, detail in zip(feeds, details, strict=True)
     ]
 
@@ -946,9 +974,22 @@ async def feed_autocomplete(
         return []
 
 
+FEED_VALUE_PREFIX = "id:"
+
+
+def feed_value(feed_id: int) -> str:
+    """The value of a Feed option as autocomplete offers it. A typed number is not one."""
+    return f"{FEED_VALUE_PREFIX}{feed_id}"
+
+
 def parse_feed_option(value: str) -> int:
-    """Turn the value of a Feed option back into a Feed id."""
-    ids = _to_ids([value.strip()])
+    """Turn the value of a Feed option back into a Feed id.
+
+    Only a value picked from the list counts: a number typed by hand would act on whichever
+    Feed has that id, which is not what a member typing a name or a number means.
+    """
+    text = value.strip()
+    ids = _to_ids([text[len(FEED_VALUE_PREFIX) :]]) if text.startswith(FEED_VALUE_PREFIX) else []
     if not ids:
         raise UserError(PICK_FEED)
     return ids[0]

@@ -114,7 +114,7 @@ access_group = app_commands.guild_only()(
 @access_group.command(name="grant", description="Make a role or member an Admin or a Manager.")
 @app_commands.describe(
     target="The role or member to give access to.",
-    level="Managers manage Feeds. Admins also give and take away access.",
+    level="Managers manage Feeds, using the bot's reach. Admins also give out access.",
 )
 @app_commands.choices(level=LEVEL_CHOICES)
 async def grant_command(
