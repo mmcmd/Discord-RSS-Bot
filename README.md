@@ -1,6 +1,42 @@
-# Discord RSS Bot
+<h1 align="center">📰 Discord RSS Bot</h1>
 
-A self-hosted Discord bot that posts new items from RSS and Atom feeds into channels. You run it on your own machine with Docker; the people in your Discord servers add and manage feeds with slash commands.
+<div align="center">
+
+[![Status](https://img.shields.io/badge/status-active-success.svg)]()
+[![Docker image](https://img.shields.io/badge/ghcr.io-discord--rss--bot-blue?logo=docker)](https://github.com/mmcmd/Discord-RSS-Bot/pkgs/container/discord-rss-bot)
+[![GitHub Issues](https://img.shields.io/github/issues/mmcmd/Discord-RSS-Bot.svg)](https://github.com/mmcmd/Discord-RSS-Bot/issues)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20%2B%20Commons%20Clause-blue.svg)](LICENSE)
+
+</div>
+
+---
+
+<p align="center">A self-hosted Discord bot that posts new items from RSS and Atom feeds into channels.<br>Run it on your own machine with Docker; manage feeds from Discord with slash commands.</p>
+
+> Sections marked 🔽 are collapsed. Click a title to open it.
+
+## 📝 Table of Contents
+
+- [About](#about)
+- [Getting Started](#getting_started)
+- [First steps in Discord](#first_steps)
+- [Commands](#commands)
+- 🔽 [Configuration](#configuration)
+- 🔽 [Templates](#templates)
+- 🔽 [Filters](#filters)
+- 🔽 [Role mentions](#role_mentions)
+- 🔽 [Post as](#post_as)
+- 🔽 [Forum channels](#forum_channels)
+- 🔽 [OPML import and export](#opml)
+- 🔽 [How it behaves](#behaviour)
+- 🔽 [Log entries and the Logs channel](#log_entries)
+- 🔽 [Reading the logs](#reading_logs)
+- 🔽 [Data and backup](#backup)
+- 🔽 [Development](#development)
+- [Licence](#licence)
+
+
+## 🧐 About <a name="about"></a>
 
 What it is built to do well:
 
@@ -8,11 +44,9 @@ What it is built to do well:
 - **Messages you can change.** Every feed has its own message text, optional embed, link buttons, filters and role mentions, and can post under its own name and picture. Feeds can post into forum channels.
 - **Small footprint.** The image is about 67 MB on disk (16 MB to download), runs as an unprivileged user, asks Discord for no privileged intents and keeps no message or member data. All state is one SQLite file.
 
-**Not yet verified.** This version has been tested without a live Discord connection.
-
 The words with capital letters in this file (Feed, Item, Check, Template and so on) are used in one fixed sense; `CONTEXT.md` defines them.
 
-## Quick start
+## 🏁 Getting Started <a name="getting_started"></a>
 
 You need Docker with Compose, and a Discord account that can add bots to your server.
 
@@ -31,6 +65,9 @@ Open this address in a browser, with your own application ID (shown on the **Gen
 https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot+applications.commands&permissions=309774699520
 ```
 
+<details>
+<summary><b>🔑 Permissions the link grants, and how to build the link yourself</b></summary>
+
 Or build the link yourself under **OAuth2 > URL Generator**: tick the scopes `bot` and `applications.commands`, and these permissions:
 
 | Permission | What the bot uses it for |
@@ -46,9 +83,19 @@ Or build the link yourself under **OAuth2 > URL Generator**: tick the scopes `bo
 
 The number in the link above is exactly this set. If you leave out Mention Everyone, use `permissions=309774568448`.
 
+</details>
+
 The bot also has to be able to see and post in the channels you point Feeds at. In a private channel, add the bot to it.
 
 ### 3. Run it
+
+Download the image:
+
+```
+docker pull ghcr.io/mmcmd/discord-rss-bot:latest
+```
+
+Then get the compose file and create your settings:
 
 ```
 git clone https://github.com/mmcmd/Discord-RSS-Bot.git
@@ -62,34 +109,48 @@ Open `.env` and put the token after `DISCORD_TOKEN=`. Then:
 docker compose up -d
 ```
 
-Until a release image has been published, the compose file has to build the bot from source. Use this instead:
-
-```
-docker compose up -d --build
-```
-
 The bot registers its slash commands when it starts. They can take a few minutes to show up in Discord the first time. To see what the bot is doing:
 
 ```
 docker compose logs -f rssbot
 ```
 
-To update later: `docker compose pull && docker compose up -d` (or `git pull && docker compose up -d --build` if you build from source).
+To update later: `docker compose pull && docker compose up -d`.
 
-## Configuration
+<details>
+<summary><b>🐳 Without Compose (plain <code>docker run</code>)</b></summary>
 
-All settings are environment variables, normally set in `.env`.
+Put the token in a file called `.env`:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `DISCORD_TOKEN` | none, required | The bot token from the developer portal. Without it the container prints a message and exits with status 2. |
-| `ALLOW_PRIVATE_URLS` | `false` | Allow Feed addresses (and the images and pages the bot reads for them) that lead to private, local or link-local network addresses. `1`, `true`, `yes` and `on` mean yes; anything else means no. Leave it off unless you want to follow feeds on your own network. |
-| `LOG_LEVEL` | `INFO` | How much the bot writes to the container log: one of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. See "Reading the logs". Any other value stops the bot with status 2 and a message saying so. |
-| `DATA_DIR` | `/data` | Where the database lives. The image sets this to the `/data` volume; do not set it in `.env`. If the bot cannot write to this folder it prints `Configuration problem: ...` saying so and exits with status 2. |
+```
+DISCORD_TOKEN=your-token-here
+```
 
-If Discord refuses the token, the bot logs that and exits with status 1.
+Then start the bot, keeping its database in a named volume:
 
-## First steps in Discord
+```
+docker run -d --name rssbot --env-file .env -v rssbot-data:/data --restart unless-stopped ghcr.io/mmcmd/discord-rss-bot:latest
+```
+
+Read its log with `docker logs -f rssbot`. To update, run `docker pull ghcr.io/mmcmd/discord-rss-bot:latest`, then `docker rm -f rssbot` and the `docker run` command again; the volume keeps your data.
+
+</details>
+
+<details>
+<summary><b>🔧 Building from source</b></summary>
+
+You do not need this unless you want to run your own changes. After the `git clone` and `.env` steps above, build the image from the checkout instead of pulling it:
+
+```
+docker compose up -d --build
+```
+
+To update a source build: `git pull && docker compose up -d --build`. The tests and the development workflow are described under [Development](#development).
+
+</details>
+
+
+## 🚀 First steps in Discord <a name="first_steps"></a>
 
 Replies to the commands below are private: only the person who used the command sees them.
 
@@ -99,7 +160,7 @@ Replies to the commands below are private: only the person who used the command 
 
 Everyone in the server can see the commands in Discord's list; the bot refuses people who have no access with "Only Managers and Admins of this Server can do that." The exception is `/help`, which anyone can use.
 
-## Commands
+## 🎈 Commands <a name="commands"></a>
 
 A Feed is chosen by name in the `feed` option of a command: start typing and pick from the list that appears. It can match the Feed's name or its address. When two Feeds would look the same in that list, the site's host is added to tell them apart.
 
@@ -130,7 +191,8 @@ A Feed is chosen by name in the `feed` option of a command: start typing and pic
 | `/filter feed` | Manager | Shows the Feed's Filters and lets you add and remove words. |
 | `/help` | Anyone | Explains the commands, a category at a time: **Feeds** and **Templates** for Managers, plus **Admin** for Admins. Buttons switch category and ◀ ▶ turn the page. Someone with no access is told to ask an Admin for it. |
 
-### The Feed panel
+<details>
+<summary><b>🎛️ The Feed panel</b></summary>
 
 `/feed add`, `/feed edit` and the menu in `/feed list` open a panel for one Feed. Everything about a Feed can be changed from it:
 
@@ -151,7 +213,28 @@ The check interval can be 5, 10, 15 or 30 minutes, or 1, 3, 6, 12 or 24 hours. T
 
 A Feed can post in a text channel, an announcement channel, a thread or a forum channel. The same address can be used in several channels, but only once in each; each of those is its own Feed.
 
-## Templates
+</details>
+
+<a name="configuration"></a>
+<details>
+<summary><b>⚙️ Configuration</b></summary>
+
+All settings are environment variables, normally set in `.env`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DISCORD_TOKEN` | none, required | The bot token from the developer portal. Without it the container prints a message and exits with status 2. |
+| `ALLOW_PRIVATE_URLS` | `false` | Allow Feed addresses (and the images and pages the bot reads for them) that lead to private, local or link-local network addresses. `1`, `true`, `yes` and `on` mean yes; anything else means no. Leave it off unless you want to follow feeds on your own network. |
+| `LOG_LEVEL` | `INFO` | How much the bot writes to the container log: one of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. See "Reading the logs". Any other value stops the bot with status 2 and a message saying so. |
+| `DATA_DIR` | `/data` | Where the database lives. The image sets this to the `/data` volume; do not set it in `.env`. If the bot cannot write to this folder it prints `Configuration problem: ...` saying so and exits with status 2. |
+
+If Discord refuses the token, the bot logs that and exits with status 1.
+
+</details>
+
+<a name="templates"></a>
+<details>
+<summary><b>🎨 Templates</b></summary>
 
 A Feed's Template says what is posted for each Item: message text, an Embed, or both, and up to five Buttons. Text in a Template is ordinary Discord text, so `**bold**`, `[links](https://example.com)` and emoji work. Placeholders in it are replaced with parts of the Item.
 
@@ -223,7 +306,11 @@ Value: {{author||feed_title}}
 
 A Button is a link button under the message: a label (up to 80 characters) and an address (up to 512), both with Placeholders. The form offers `{{link}}` as the address. An address must start with `http://`, `https://` or one of `{{link}}`, `{{image}}` and `{{feed_link}}`; a Placeholder further on in an address, as in `https://www.google.com/search?q={{title}}`, is percent-encoded so that spaces and other characters cannot break it (the same goes for an Embed's link and image). A Feed can have up to 5. A Button whose label or address comes out empty for an Item is left out for that Item.
 
-## Filters
+</details>
+
+<a name="filters"></a>
+<details>
+<summary><b>🔍 Filters</b></summary>
 
 Filters decide which Items are posted. There are two lists:
 
@@ -234,11 +321,19 @@ Matching is on whole words and ignores capital letters, so `cat` matches "Cat" b
 
 Add words with **Add must-have words** or **Add block words**: one word or phrase per line, up to 100 characters each, and up to 100 Filters per Feed. A word cannot be in both lists for the same place to look. Remove one with the menu. A Filter is only applied to Items the Feed finds from then on; an Item that a Filter held back is recorded as seen and is not posted later, even if you change the Filters.
 
-## Role mentions
+</details>
+
+<a name="role_mentions"></a>
+<details>
+<summary><b>🔔 Role mentions</b></summary>
 
 On the panel, press **Mentions** and choose up to 10 roles. Every message the Feed posts then pings them. Put `{{mentions}}` in the message text to choose where the pings go; without it they are put at the start of the message. The bot pings only the roles chosen there: never `@everyone`, `@here` or individual people, even if an Item's text contains them. To ping a role that is not set to "Allow anyone to @mention this role", the bot needs the Mention Everyone permission.
 
-## Post as
+</details>
+
+<a name="post_as"></a>
+<details>
+<summary><b>🎭 Post as</b></summary>
 
 Post as is the name and picture a Feed's messages appear under.
 
@@ -248,7 +343,11 @@ Post as is the name and picture a Feed's messages appear under.
 
 For the last two the bot posts through a webhook called "RSS feeds" that it creates itself, one per channel and shared by the Feeds in that channel; it removes the webhook when no Feed in the channel needs it any more. This needs the **Manage Webhooks** permission. Without it, or when the channel is full of webhooks, the Feeds in that channel keep working but post as the bot, and the Logs channel is told once. Discord does not allow "discord" or "clyde" in these names, so the bot alters them slightly.
 
-## Forum channels
+</details>
+
+<a name="forum_channels"></a>
+<details>
+<summary><b>💬 Forum channels</b></summary>
 
 A Feed can be bound to a forum channel. Each Item then becomes a new Forum post, with the Feed's message text, Embed and Buttons as the post's first message.
 
@@ -258,7 +357,11 @@ Press **Forum options** on the panel (it appears only for forum Feeds):
 - **Tags.** Up to 5 of the forum's own tags, put on every Forum post. If the forum requires a tag on every post and the Feed has none, the Feed is paused and the Logs channel says so; choosing a tag resumes it.
 - **Cover image.** When on, the Item's image is downloaded (PNG, JPEG, GIF or WebP, up to 8 MB) and attached to the Forum post so that it shows as the post's picture. If the image cannot be downloaded or attached, the Item is posted without it. This needs the Attach Files permission.
 
-## OPML import and export
+</details>
+
+<a name="opml"></a>
+<details>
+<summary><b>📥 OPML import and export</b></summary>
 
 OPML is the file format most feed readers use to move a list of feeds.
 
@@ -266,7 +369,11 @@ OPML is the file format most feed readers use to move a list of feeds.
 
 **Export.** `/feed export` sends `feeds.opml` with the name and address of every Feed in the Server. Channels, Templates and Filters are not included.
 
-## How it behaves
+</details>
+
+<a name="behaviour"></a>
+<details>
+<summary><b>🧠 How it behaves</b></summary>
 
 - **Nothing is posted when a Feed is added.** Whatever the source lists at that moment is recorded as seen; only Items that appear afterwards are posted. The same goes for a Feed whose address you change.
 - **At most 10 new Items per Check.** If more than ten new Items have appeared (after a long outage, say), the ten newest are posted, oldest first, and the rest are skipped for good. Items held back by Filters do not count towards the ten. A Check that runs short of time posts what it can and leaves the remaining Items for the next Check; that is not a failure.
@@ -278,7 +385,11 @@ OPML is the file format most feed readers use to move a list of feeds.
 - **Private network addresses are refused.** Feed addresses, redirects, site pages and images that lead to private, local or link-local addresses are not fetched, however they are written, unless you set `ALLOW_PRIVATE_URLS=true`. Addresses with a username or password in them are always refused. The bot reads at most 5 MB from a feed, follows at most 5 redirects, and waits at most 30 seconds for an answer.
 - Several Feeds are checked at the same time (up to five), and each wait is stretched by up to a tenth so that Feeds drift apart instead of all being fetched together.
 
-## Log entries and the Logs channel
+</details>
+
+<a name="log_entries"></a>
+<details>
+<summary><b>📜 Log entries and the Logs channel</b></summary>
 
 Every change a member or the bot makes is saved as a **Log entry**: who did it, what, to which Feed, and when. Entries are kept for one year. Two kinds are kept for as long as they stay true: who added a Feed that still exists, and who paused a Feed that is still paused. When the bot is removed from a Server, its Log entries are deleted with the Server's other data 30 days later.
 
@@ -298,7 +409,11 @@ Where to see them:
 
 A Server with no Logs channel still has all its Log entries; only the posting is skipped.
 
-## Reading the logs
+</details>
+
+<a name="reading_logs"></a>
+<details>
+<summary><b>🪵 Reading the logs</b></summary>
 
 The bot writes its own log to the container's output, one line each, and Docker keeps it. Read it with:
 
@@ -341,7 +456,11 @@ The same for a Feed: `grep feed=45`.
 
 **Rotation.** Docker's job, not the bot's. `compose.yaml` sets the `json-file` driver to keep at most 5 files of 10 MB for this container, so the log cannot fill the disk. Change `max-size` and `max-file` under `logging:` there if you want more history. The Log entries behind `/feed history` and `/log` are in the database, not in the container log, and are not lost when Docker rotates it.
 
-## Data and backup
+</details>
+
+<a name="backup"></a>
+<details>
+<summary><b>💾 Data and backup</b></summary>
 
 Everything the bot keeps is one SQLite database, `rssbot.db`, in the `/data` volume (the compose file calls it `rssbot-data`). It holds the Feeds, Templates, Filters, access Grants, Logs channels, the Log entries, the record of Items already seen and the webhook addresses the bot created. The bot token is not stored there, but the webhook addresses are secret, so keep backups private.
 
@@ -355,7 +474,11 @@ docker compose start rssbot
 
 To restore, put the files back in the volume while the bot is stopped.
 
-## Development
+</details>
+
+<a name="development"></a>
+<details>
+<summary><b>🛠️ Development</b></summary>
 
 The tests run in Docker; nothing needs to be installed on the host.
 
@@ -373,6 +496,8 @@ docker run --rm -v "$PWD":/app:ro rssbot-dev ruff check src tests
 
 The code is in `src/rssbot`; `CONTEXT.md` has the vocabulary and `docs/adr/` the decisions behind the design. A tag such as `v0.1.0` makes GitHub Actions build the image for `linux/amd64` and `linux/arm64` and publish it to `ghcr.io/mmcmd/discord-rss-bot` as `0.1.0` and `latest`.
 
-## Licence
+</details>
+
+## 📄 Licence <a name="licence"></a>
 
 This project is under the MIT licence with the Commons Clause. You may use it, change it and host it yourself for free, including inside a business. You may not sell it, and that includes offering it to others as a paid hosted service or charging for support or consulting whose value comes mainly from the bot. See `LICENSE` for the full text.
