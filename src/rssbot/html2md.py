@@ -305,17 +305,43 @@ def _wrap(kind: str, inner: str, url: str, bare_ok: bool, in_code: bool) -> str:
     return f"{lead}{body}{trail}"
 
 
+def _join_marks(parts: list[str], last: str, kind: str, wrapped: str) -> str:
+    """Keep two marks that touch from running together: merge equal ones, space out the rest.
+
+    `last` is the kind of the mark that ended `parts`, or "" when something else did.
+    """
+    if last not in _MARK_TEXT or kind not in _MARK_TEXT or not parts:
+        return wrapped
+    closing, opening = _MARK_TEXT[last], _MARK_TEXT[kind]
+    previous = parts[-1]
+    if not (previous.endswith(closing) and wrapped.startswith(opening)):
+        return wrapped  # whitespace already sits between them
+    if last == kind:
+        parts[-1] = previous[: -len(closing)]
+        return wrapped[len(opening) :]
+    return " " + wrapped
+
+
 def _render(tokens: list[_Token]) -> str:
     frames: list[tuple[str, list[str]]] = [("", [])]
+    lasts = [""]  # per frame: the kind of mark that ended it, if one did
     for op, value, bare_ok in tokens:
         if op == _TEXT:
             frames[-1][1].append(value)
+            lasts[-1] = ""
         elif op == _OPEN:
             frames.append((value, []))
+            lasts.append("")
         elif len(frames) > 1:
             kind, parts = frames.pop()
+            lasts.pop()
             in_code = any(outer == "code" for outer, _ in frames)
-            frames[-1][1].append(_wrap(kind, "".join(parts), value, bare_ok, in_code))
+            wrapped = _wrap(kind, "".join(parts), value, bare_ok, in_code)
+            target = frames[-1][1]
+            if not in_code:
+                wrapped = _join_marks(target, lasts[-1], kind, wrapped)
+            target.append(wrapped)
+            lasts[-1] = kind
     return "".join("".join(parts) for _, parts in frames)
 
 

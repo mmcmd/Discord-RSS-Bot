@@ -962,3 +962,20 @@ def test_first_image_ignores_images_in_scripts_and_comments():
     )
 
     assert first_image(html) == "https://e.com/real.png"
+
+
+# --- review fixes ---
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        ("<b>Bold</b><i>ital</i>", "**Bold** *ital*"),
+        ("<b>a</b><b>b</b>", "**ab**"),
+        ("<i>a</i><i>b</i>", "*ab*"),
+        ("<i>a</i><b>b</b>", "*a* **b**"),
+        ("<b>a</b> <b>b</b>", "**a** **b**"),
+    ],
+)
+def test_adjacent_marks_stay_unambiguous(html: str, expected: str) -> None:
+    assert to_markdown(html) == expected

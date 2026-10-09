@@ -90,6 +90,8 @@ _IMAGE_EXTENSIONS = {
     "image/gif": "gif",
     "image/webp": "webp",
 }
+# Other names servers give JPEG. Accepted on the header only; the bytes are sniffed afterwards.
+_JPEG_ALIASES = {"image/jpg": "jpg", "image/pjpeg": "jpg"}
 _FEED_ACCEPT = (
     "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5"
 )
@@ -279,6 +281,11 @@ def _validator(value: str | None) -> str | None:
     return value if _header_safe(value) else None
 
 
+def _header_text(value: str | None) -> str:
+    """A header worth passing on: printable, one line, of sane length. Otherwise empty."""
+    return value.strip() if value and len(value) <= 256 and _header_safe(value) else ""
+
+
 def _retry_after(value: str | None) -> float | None:
     """Seconds to wait from a Retry-After header, which is a number of seconds or a date."""
     if not value:
@@ -413,6 +420,7 @@ class HttpFetcher:
                 etag=_validator(response.headers.get("ETag")),
                 last_modified=_validator(response.headers.get("Last-Modified")),
                 url=final_url,
+                content_type=_header_text(response.headers.get("Content-Type")),
             )
 
         started = time.monotonic()
@@ -444,7 +452,7 @@ class HttpFetcher:
         async def handle(response: aiohttp.ClientResponse, final_url: str) -> ImageData:
             if response.status != 200:
                 raise FetchError(f"The site answered with error {response.status}.")
-            if response.content_type not in _IMAGE_EXTENSIONS:
+            if response.content_type not in _IMAGE_EXTENSIONS | _JPEG_ALIASES:
                 raise FetchError(NOT_AN_IMAGE_MESSAGE)
             data = await _read_limited(
                 response, max_bytes, f"The image is larger than {_size_label(max_bytes)}."
@@ -492,7 +500,7 @@ class HttpFetcher:
     ) -> T:
         session = self._get_session()
         for hop in range(MAX_REDIRECTS + 1):
-            target = self._parse_url(url)
+            target = self._parse_url(url, redirected=hop > 0)
             # Redirects are never left to aiohttp: each hop is parsed and checked here.
             async with session.get(target, headers=headers, allow_redirects=False) as response:
                 if response.status not in _REDIRECT_STATUSES:
@@ -508,9 +516,12 @@ class HttpFetcher:
                     raise FetchError(BAD_REDIRECT_MESSAGE) from None
         raise FetchError(TOO_MANY_REDIRECTS_MESSAGE)
 
-    def _parse_url(self, url: str) -> URL:
+    def _parse_url(self, url: str, *, redirected: bool = False) -> URL:
         """Check a URL, from a Manager or from a redirect, and parse it for aiohttp."""
-        bad = FetchError(BAD_URL_MESSAGE, permanent=True)
+        # A Location the Manager never typed gets the redirect message, not advice about
+        # the address they gave.
+        message = BAD_REDIRECT_MESSAGE if redirected else BAD_URL_MESSAGE
+        bad = FetchError(message, permanent=True)
         if not isinstance(url, str) or not url or len(url) > MAX_URL_LENGTH:
             raise bad
         # Whitespace, control characters and backslashes are where URL parsers disagree.
@@ -526,7 +537,7 @@ class HttpFetcher:
         if parsed.scheme not in ("http", "https") or not parsed.raw_host:
             raise bad
         if "@" in netloc or parsed.raw_user is not None or parsed.raw_password is not None:
-            raise FetchError(CREDENTIALS_MESSAGE, permanent=True)
+            raise bad if redirected else FetchError(CREDENTIALS_MESSAGE, permanent=True)
         if not self._allow_private:
             literal = _literal_ip(parsed.host or "")
             if literal is not None and not self._is_allowed(str(literal)):

@@ -40,10 +40,14 @@ class ParseError(Exception):
     """The body is not a feed. The message is one plain sentence for a Discord user."""
 
 
-def parse_feed(body: bytes, url: str = "") -> ParsedFeed:
-    """Parse a fetched feed. `url` is the Feed's address, used to resolve relative links."""
+def parse_feed(body: bytes, url: str = "", content_type: str = "") -> ParsedFeed:
+    """Parse a fetched feed. `url` is the Feed's address, used to resolve relative links.
+
+    `content_type` is the Content-Type header, whose charset decides the text encoding when the
+    feed does not declare one.
+    """
     try:
-        return _parse(body, url)
+        return _parse(body, url, content_type)
     except ParseError:
         raise
     except Exception as error:
@@ -142,7 +146,7 @@ def _newest(entries: list[Any]) -> list[Any]:
     return [entries[index] for index in sorted(newest[:MAX_ITEMS])]
 
 
-def _parse(body: bytes, url: str) -> ParsedFeed:
+def _parse(body: bytes, url: str, content_type: str = "") -> ParsedFeed:
     if isinstance(body, str):
         body = body.encode("utf-8", "replace")
     if not isinstance(body, bytes | bytearray | memoryview):
@@ -156,7 +160,15 @@ def _parse(body: bytes, url: str) -> ParsedFeed:
     # A stream, because feedparser would try a bare string as a URL or a file name.
     # It is given no base URL, so ids and links come back exactly as the source wrote them:
     # an Item's key must not change when the Feed's address does. html2md does the cleaning.
-    result = feedparser.parse(io.BytesIO(body), sanitize_html=False, resolve_relative_uris=False)
+    headers = (
+        {"content-type": content_type} if isinstance(content_type, str) and content_type else None
+    )
+    result = feedparser.parse(
+        io.BytesIO(body),
+        response_headers=headers,
+        sanitize_html=False,
+        resolve_relative_uris=False,
+    )
 
     feed = result.get("feed")
     if not isinstance(feed, Mapping):
@@ -201,16 +213,18 @@ def _build_item(entry: object, base: str) -> Item | None:
         return None
     title_html = _markup(entry, "title")
     summary_html = _markup(entry, "summary")
-    content_html = _content(entry)
+    content_html, content_base = _content(entry, base)
+    summary_base = _detail_base(entry.get("summary_detail"), base)
     if not summary_html:
         summary_html, content_html = content_html, ""
+        summary_base = content_base
 
     key = _key(entry, title_html, summary_html)
     if not key:
         return None
 
-    summary = _cap(to_markdown(summary_html, base))
-    content = _cap(to_markdown(content_html, base))
+    summary = _cap(to_markdown(summary_html, summary_base))
+    content = _cap(to_markdown(content_html, content_base))
     if content == summary:
         content = ""
 
@@ -223,7 +237,7 @@ def _build_item(entry: object, base: str) -> Item | None:
         author=_author(entry),
         published=_published(entry),
         categories=_categories(entry),
-        image=_image(entry, content_html, summary_html, base),
+        image=_image(entry, content_html, summary_html, base, content_base, summary_base),
     )
 
 
@@ -272,16 +286,28 @@ def _as_html(value: str, detail: object) -> str:
     return value
 
 
-def _content(entry: _Entry) -> str:
+def _content(entry: _Entry, base: str) -> tuple[str, str]:
+    """The first content part as HTML, with the base its links resolve against."""
     parts = entry.get("content")
     if not isinstance(parts, list):
-        return ""
+        return "", base
     for part in parts:
         if isinstance(part, Mapping):
             value = part.get("value")
             if isinstance(value, str) and value.strip():
-                return _as_html(value, part)
-    return ""
+                return _as_html(value, part), _detail_base(part, base)
+    return "", base
+
+
+def _detail_base(detail: object, base: str) -> str:
+    """The Feed's address, or the xml:base feedparser worked out for this text, made absolute."""
+    declared = detail.get("base") if isinstance(detail, Mapping) else None
+    if not isinstance(declared, str) or not declared.strip():
+        return base
+    try:
+        return urljoin(base, declared.strip()) if base else declared.strip()
+    except ValueError:
+        return base
 
 
 def _author(entry: _Entry) -> str:
@@ -366,7 +392,9 @@ def _media_content_image(media: Mapping[str, Any], base: str) -> str:
     return url if _looks_like_image(url) else ""
 
 
-def _image_candidates(entry: _Entry, content: str, summary: str, base: str) -> Iterator[str]:
+def _image_candidates(
+    entry: _Entry, content: str, summary: str, base: str, content_base: str, summary_base: str
+) -> Iterator[str]:
     for media in _dicts(entry.get("media_content")):
         yield _media_content_image(media, base)
     for thumbnail in _dicts(entry.get("media_thumbnail")):
@@ -377,12 +405,15 @@ def _image_candidates(entry: _Entry, content: str, summary: str, base: str) -> I
     image = entry.get("image")
     if isinstance(image, Mapping):
         yield _resolve(image.get("href"), base)
-    yield first_image(content, base)
-    yield first_image(summary, base)
+    yield first_image(content, content_base)
+    yield first_image(summary, summary_base)
 
 
-def _image(entry: _Entry, content: str, summary: str, base: str) -> str:
-    return next((url for url in _image_candidates(entry, content, summary, base) if url), "")
+def _image(
+    entry: _Entry, content: str, summary: str, base: str, content_base: str, summary_base: str
+) -> str:
+    candidates = _image_candidates(entry, content, summary, base, content_base, summary_base)
+    return next((url for url in candidates if url), "")
 
 
 def _feed_image(feed: _Entry, base: str) -> str:

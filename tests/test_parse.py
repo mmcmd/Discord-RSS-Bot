@@ -576,3 +576,27 @@ def test_undated_items_in_a_long_listing_stay_with_their_neighbours() -> None:
 def test_a_file_name_as_body_is_not_opened() -> None:
     with pytest.raises(ParseError):
         parse_feed(str(FIXTURES / "rss20.xml").encode(), BASE)
+
+
+# --- review fixes ---
+
+
+def test_http_charset_is_honoured_without_an_xml_declaration() -> None:
+    xml = (
+        "<rss version='2.0'><channel><title>Feed</title>"
+        "<item><title>Привет мир</title><guid>1</guid></item></channel></rss>"
+    )
+    body = xml.encode("koi8-r")
+    feed = parse_feed(body, BASE, content_type="text/xml; charset=koi8-r")
+    assert feed.items[0].title == "Привет мир"
+
+
+def test_xml_base_applies_to_links_in_item_text() -> None:
+    body = b"""<feed xmlns="http://www.w3.org/2005/Atom"><title>F</title>
+    <entry><id>1</id><title>T</title>
+    <summary type="html" xml:base="https://other.example/a/">
+    &lt;a href="x.html"&gt;go&lt;/a&gt; &lt;img src="p.png"&gt;</summary>
+    </entry></feed>"""
+    item = parse_feed(body, BASE).items[0]
+    assert "(https://other.example/a/x.html)" in item.summary
+    assert item.image == "https://other.example/a/p.png"
