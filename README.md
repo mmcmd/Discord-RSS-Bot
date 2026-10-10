@@ -6,6 +6,7 @@
 [![Docker image](https://img.shields.io/badge/ghcr.io-discord--rss--bot-blue?logo=docker)](https://github.com/mmcmd/Discord-RSS-Bot/pkgs/container/discord-rss-bot)
 [![GitHub Issues](https://img.shields.io/github/issues/mmcmd/Discord-RSS-Bot.svg)](https://github.com/mmcmd/Discord-RSS-Bot/issues)
 [![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20%2B%20Commons%20Clause-blue.svg)](LICENSE)
+![Discord](https://img.shields.io/discord/1558302416431091763)
 
 </div>
 
