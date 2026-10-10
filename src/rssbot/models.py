@@ -118,6 +118,11 @@ class EmbedSpec:
     fields: tuple[FieldSpec, ...] = ()
     timestamp: bool = True  # show the Item's date after the footer, in each viewer's own time
 
+    @property
+    def is_empty(self) -> bool:
+        """True when nothing would be shown, so no Embed is posted (link, colour, date add none)."""
+        return not (self.title or self.description or self.image or self.footer or self.fields)
+
 
 @dataclass(frozen=True, slots=True)
 class ButtonSpec:

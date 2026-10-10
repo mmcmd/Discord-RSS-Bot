@@ -336,7 +336,9 @@ def _embed_controls(interaction: discord.Interaction, feed_id: int) -> Controls:
             ColourSelect(feed_id, current=embed.colour, chosen=True),
             EditEmbed(feed_id, KEEP_COLOUR, label="Edit again"),
             OpenFields(feed_id),
-            ToggleTimestamp(feed_id, label=_timestamp_label(embed.timestamp)),
+            ToggleTimestamp(
+                feed_id, 0 if embed.timestamp else 1, label=_timestamp_label(embed.timestamp)
+            ),
             RemoveEmbed(feed_id),
             BackToFeed(feed_id),
         ]
@@ -426,14 +428,17 @@ async def embed_submitted(
         else:
             _check_address("The Embed link", parts["url"])
             _check_address("The Embed image", parts["image"])
-            await service.set_embed(
+            saved = await service.set_embed(
                 feed.server_id,
                 feed.id,
                 **parts,
                 colour=_colour_of(ids[1]),
                 actor=ui.actor_of(interaction),
             )
-            headline = f"Saved the Embed of {_name(feed)}."
+            if saved.embed is None:  # a link alone: the service keeps no Embed that shows nothing
+                headline = f"{_name(feed)} has no Embed now: a link alone shows nothing."
+            else:
+                headline = f"Saved the Embed of {_name(feed)}."
     except (ServiceError, ui.UserError) as exc:
         sent = [
             ("Title", parts["title"]),
@@ -501,14 +506,20 @@ def _timestamp_label(on: bool) -> str:
     return f"Append post date to footer (local time): {'on' if on else 'off'}"
 
 
-class ToggleTimestamp(ui.ActionButton, action="tpl_embed_time", ids=1, requires=Level.MANAGER):
+class ToggleTimestamp(ui.ActionButton, action="tpl_embed_time", ids=2, requires=Level.MANAGER):
+    """Its second id is what a click sets: 1 shows the post date, 0 does not.
+
+    Carried in the id so that a click on a stale message sets the state it shows
+    instead of flipping whatever is saved now.
+    """
+
     label = _timestamp_label(True)
 
     async def handle(self, interaction: discord.Interaction) -> None:
         feed = ui.feed_of(interaction, self.ids[0])
         if feed.embed is None:
             raise ui.UserError("This Feed has no Embed.")
-        on = not feed.embed.timestamp
+        on = self.ids[1] == 1
         await ui.defer(interaction, update=True)
         await _service(interaction).set_embed(
             feed.server_id, feed.id, timestamp=on, actor=ui.actor_of(interaction)

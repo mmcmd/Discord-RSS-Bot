@@ -99,7 +99,7 @@ def _build(feed: Feed, item: Item, *, customised: bool) -> OutgoingMessage:
             embed = _embed(feed.embed, values, plain)
             if cover is not None and embed.image == cover:
                 embed = replace(embed, image="")  # the Cover image already shows it
-            if _is_empty(embed):
+            if embed.is_empty:
                 embed = None
         buttons = _buttons(feed.buttons, plain)
 
@@ -252,12 +252,6 @@ def _embed(spec: EmbedSpec, values: Mapping[str, str], plain: Mapping[str, str])
         colour=colour,
         fields=tuple(fields),
         timestamp=spec.timestamp,
-    )
-
-
-def _is_empty(embed: EmbedSpec) -> bool:
-    return not (
-        embed.title or embed.description or embed.image or embed.footer or embed.fields
     )
 
 

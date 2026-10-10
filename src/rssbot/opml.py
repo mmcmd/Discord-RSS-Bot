@@ -27,6 +27,14 @@ class OpmlError(ValueError):
 # UTF-16 and UTF-32 files are caught too.
 _DECLARATION = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
 
+_ENCODING = re.compile(
+    rb"\A\s*<\?xml[^>]*?\sencoding\s*=\s*[\"']([A-Za-z][A-Za-z0-9._-]*)[\"']", re.IGNORECASE
+)
+# What expat decodes itself. Any other declared encoding is decoded here first.
+_EXPAT_ENCODINGS = frozenset(
+    {"utf-8", "utf8", "utf-16", "utf16", "iso-8859-1", "us-ascii", "ascii"}
+)
+
 # Characters XML 1.0 cannot carry at all, not even as character references.
 _ILLEGAL_XML = re.compile("[^\t\n\r\x20-퟿-�\U00010000-\U0010ffff]")
 
@@ -48,7 +56,7 @@ class _Collector:
         lowered: dict[str, str] = {}
         for key, value in attrs.items():
             lowered.setdefault(key.lower(), value)
-        url = lowered.get("xmlurl", "").strip()
+        url = _feed_url(lowered.get("xmlurl", "").strip())
         if not _is_web_url(url) or url in self._seen:
             return
         if len(self.entries) >= MAX_OPML_ENTRIES:
@@ -56,6 +64,16 @@ class _Collector:
         self._seen.add(url)
         title = lowered.get("title", "").strip() or lowered.get("text", "").strip() or url
         self.entries.append(OpmlEntry(title=title, url=url))
+
+
+def _feed_url(url: str) -> str:
+    """Browsers' feed: scheme, in both of its forms, as the plain address it wraps."""
+    if url[:5].lower() != "feed:":
+        return url
+    rest = url[5:]
+    if rest.startswith("//"):
+        return "http:" + rest
+    return rest
 
 
 def _is_web_url(url: str) -> bool:
@@ -81,15 +99,28 @@ def parse_opml(data: bytes) -> list[OpmlEntry]:
     parser.StartDoctypeDeclHandler = _reject_declaration
     parser.EntityDeclHandler = _reject_declaration
     try:
-        parser.Parse(data, True)
+        parser.Parse(_decoded(data), True)
+    except OpmlError:
+        raise
     except expat.ExpatError:
         raise OpmlError("The file is not valid XML, so it is not an OPML feed list.") from None
-    except (LookupError, UnicodeError):
+    except (LookupError, ValueError):
         raise OpmlError("The file uses a text encoding that cannot be read.") from None
 
     if not collector.entries:
         raise OpmlError("The file does not contain any feeds.")
     return collector.entries
+
+
+def _decoded(data: bytes) -> bytes | str:
+    """Text for expat. It cannot read gb2312, shift_jis, euc-kr and the like, so Python does."""
+    match = _ENCODING.match(data)
+    if match is None:
+        return data
+    name = match.group(1).decode("ascii").lower()
+    if name in _EXPAT_ENCODINGS:
+        return data
+    return data.decode(name)  # LookupError or UnicodeError: parse_opml reports it
 
 
 def _attribute(value: str) -> str:

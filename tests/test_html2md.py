@@ -134,6 +134,21 @@ def test_link_with_no_text_or_a_url_as_text_is_just_the_url(html):
 @pytest.mark.parametrize(
     ("html", "expected"),
     [
+        (
+            '<p>Share:<a href="https://t.com/s?u=1"><i></i></a><a href="https://f.com/s?u=1"><i></i></a></p>',
+            "Share: https://t.com/s?u=1 https://f.com/s?u=1",
+        ),
+        ('<p>See<a href="https://x.com/a"></a>here</p>', "See https://x.com/a here"),
+        ('<p>See <a href="https://x.com/a"></a>.</p>', "See https://x.com/a ."),
+    ],
+)
+def test_link_with_no_text_is_kept_apart_from_the_words_around_it(html, expected):
+    assert to_markdown(html) == expected
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
         ('<a href="javascript:alert(1)">click</a>', "click"),
         ('<a href="mailto:me@e.com">mail me</a>', "mail me"),
         ('<a href="data:text/html,hi">data</a>', "data"),
@@ -962,3 +977,20 @@ def test_first_image_ignores_images_in_scripts_and_comments():
     )
 
     assert first_image(html) == "https://e.com/real.png"
+
+
+# --- review fixes ---
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        ("<b>Bold</b><i>ital</i>", "**Bold** *ital*"),
+        ("<b>a</b><b>b</b>", "**ab**"),
+        ("<i>a</i><i>b</i>", "*ab*"),
+        ("<i>a</i><b>b</b>", "*a* **b**"),
+        ("<b>a</b> <b>b</b>", "**a** **b**"),
+    ],
+)
+def test_adjacent_marks_stay_unambiguous(html: str, expected: str) -> None:
+    assert to_markdown(html) == expected

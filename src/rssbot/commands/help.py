@@ -94,8 +94,10 @@ CATEGORIES = (
             ),
             Entry(
                 "feed test",
-                "Shows you privately what a Feed would post for its newest Item. Nothing goes "
-                "to the channel unless you press **Post to channel**.",
+                "Shows you privately what a Feed would post for its newest Item, with numbered "
+                "buttons for the four Items before it. Nothing goes to the channel unless you "
+                "press **Post to channel**. Items the Feed's Filters hold back are only named: "
+                "they cannot be previewed or posted.",
                 "<feed>",
                 "/feed test feed:Ars Technica",
             ),

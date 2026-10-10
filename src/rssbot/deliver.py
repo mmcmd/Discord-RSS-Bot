@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import aiohttp
 import discord
 
 from . import logembed
@@ -33,6 +34,7 @@ DEFAULT_THREAD_TITLE = "New item"
 MAX_THREAD_TITLE = 100
 MAX_USERNAME = 80
 MAX_NOTE = 2000
+NOTE_TIMEOUT_S = 10.0  # a Logs channel note that takes longer is given up on
 
 # Discord's JSON error codes. discord.py does not name them; these come from Discord's API docs.
 UNKNOWN_CHANNEL = 10003
@@ -72,15 +74,28 @@ class Step(enum.Enum):
 
 
 _CONTENT_STEPS = frozenset({Step.SEND, Step.THREAD_CREATE, Step.WEBHOOK_SEND})
+# Steps that send nothing: whatever goes wrong there, no message can have reached Discord.
+_BEFORE_SENDING = frozenset({Step.CHANNEL_FETCH, Step.WEBHOOK_CREATE})
 
 
 def classify_error(exc: BaseException, step: Step) -> DeliveryOutcome:
-    """Map an error raised at `step` to an outcome. When in doubt, RETRY."""
+    """Map an error raised at `step` to an outcome.
+
+    An answer from Discord says the message was not taken, so it is safe to RETRY. Any other
+    error while a message is being sent (connection lost, timeout) leaves it unknown whether
+    Discord took the message: that is UNKNOWN, and the Item is skipped (docs/adr/0003).
+    """
     if not isinstance(exc, discord.HTTPException):
         # fetch_channel raises InvalidData for a channel of a type that cannot hold messages.
         if isinstance(exc, discord.InvalidData) and step is Step.CHANNEL_FETCH:
             return DeliveryOutcome.LOST_CHANNEL
-        return DeliveryOutcome.RETRY  # rate-limit exhaustion, network, timeout, anything else
+        if step in _BEFORE_SENDING:
+            return DeliveryOutcome.RETRY
+        # RateLimited is raised before the request is made; a failure to connect, before
+        # anything is written to the connection.
+        if isinstance(exc, discord.RateLimited | aiohttp.ClientConnectorError):
+            return DeliveryOutcome.RETRY
+        return DeliveryOutcome.UNKNOWN
 
     status, code = exc.status, exc.code
     if code == TAG_REQUIRED:
@@ -254,14 +269,42 @@ class DiscordDeliverer:
         # So two Feeds in a channel never create two webhooks at once.
         self._webhook_locks: dict[int, asyncio.Lock] = {}
         self._warned_channels: set[int] = set()
+        self._notes: set[asyncio.Task[None]] = set()
 
     async def deliver(self, feed: Feed, message: OutgoingMessage) -> DeliveryOutcome:
         try:
             return await self._deliver(feed, message)
         except Exception:
             # Every expected failure is classified where it happens; this is the safety net.
+            # What failed is not known, so neither is whether anything was sent.
             log.exception("deliver.error feed=%s channel=%s", feed.id, feed.channel_id)
-            return DeliveryOutcome.RETRY
+            return DeliveryOutcome.UNKNOWN
+
+    async def drain(self) -> None:
+        """Wait until every Logs channel note started by a delivery is out or given up on."""
+        while self._notes:
+            await asyncio.gather(*self._notes, return_exceptions=True)
+
+    async def cleanup_unused_webhooks(self) -> None:
+        """Delete the webhooks of channels that have no Feed any more. Never raises.
+
+        Picks up what `cleanup_webhook` left behind when Discord had an error, and the
+        webhooks of channels that were deleted. A webhook a Feed in the channel still uses
+        is never touched.
+        """
+        try:
+            channels = self._db.channels_with_unused_webhook()
+        except Exception:
+            log.exception("Could not list the unused webhooks")
+            return
+        for channel_id in channels:
+            try:
+                if self._db.list_channel_feeds(channel_id):
+                    continue  # a Feed was added since the list was made
+            except Exception:
+                log.exception("Could not check the Feeds of channel %s", channel_id)
+                continue
+            await self.cleanup_webhook(channel_id)
 
     async def cleanup_webhook(self, channel_id: int) -> None:
         """Delete the channel's webhook from Discord and the store. Never raises."""
@@ -278,7 +321,9 @@ class DiscordDeliverer:
                         "webhook.delete_failed channel=%s reason=%s", channel_id, quote(str(exc))
                     )
                     return
-            self._db.delete_webhook(channel_id)
+            # Only the webhook that was deleted: a delivery may have stored a new one for the
+            # channel while Discord was answering, and deleting that would orphan it.
+            self._db.delete_webhook(channel_id, webhook_id=stored[0])
         except Exception:
             log.exception("Could not clean up the webhook of channel %s", channel_id)
 
@@ -405,7 +450,7 @@ class DiscordDeliverer:
                 webhook = await self._get_webhook(feed.channel_id, target.channel)
             except Exception as exc:
                 if webhook_unavailable(exc):
-                    await self._warn_once(feed, exc)
+                    self._warn_once(feed, exc)
                     return None
                 return classify_error(exc, Step.WEBHOOK_CREATE)
 
@@ -426,7 +471,9 @@ class DiscordDeliverer:
                 await webhook.send(wait=True, **kwargs)
             except Exception as exc:
                 if attempt == 0 and webhook_is_gone(exc):
-                    self._db.delete_webhook(feed.channel_id)
+                    # Only the webhook that failed: a concurrent Feed may have stored a new
+                    # one already, and deleting that would orphan it on Discord.
+                    self._db.delete_webhook(feed.channel_id, webhook_id=webhook.id)
                     continue
                 return classify_error(exc, Step.WEBHOOK_SEND)
             finally:
@@ -459,8 +506,11 @@ class DiscordDeliverer:
     def _partial_webhook(self, webhook_id: int, token: str) -> discord.Webhook:
         return discord.Webhook.partial(webhook_id, token, client=self._client)
 
-    async def _warn_once(self, feed: Feed, exc: BaseException) -> None:
-        """Tell the Logs channel, once per channel per run, why Post as is not being used."""
+    def _warn_once(self, feed: Feed, exc: BaseException) -> None:
+        """Tell the Logs channel, once per channel per run, why Post as is not being used.
+
+        In the background: a Logs channel that is slow or hangs must not hold up the Item.
+        """
         if feed.channel_id in self._warned_channels:
             return
         self._warned_channels.add(feed.channel_id)
@@ -482,10 +532,20 @@ class DiscordDeliverer:
             f"Feeds in <#{feed.channel_id}> are being posted under the bot's own name, "
             f"because {why}. {fix} and they will go back to their own name and picture."
         )
+        task = asyncio.get_running_loop().create_task(
+            self._send_note(feed.server_id, text), name="webhook-note"
+        )
+        # The loop only holds a weak reference: without this one the task could vanish.
+        self._notes.add(task)
+        task.add_done_callback(self._notes.discard)
+
+    async def _send_note(self, server_id: int, text: str) -> None:
+        assert self._notifier is not None
         try:
-            await self._notifier.notify(feed.server_id, text)
+            async with asyncio.timeout(NOTE_TIMEOUT_S):
+                await self._notifier.notify(server_id, text)
         except Exception:
-            log.exception("The notifier failed for Server %s", feed.server_id)
+            log.exception("The notifier failed for Server %s", server_id)
 
 
 class DiscordNotifier:

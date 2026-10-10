@@ -6,6 +6,7 @@ Feed can be changed. Other command modules show it with `open_panel`.
 
 from __future__ import annotations
 
+import hashlib
 import io
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
@@ -19,6 +20,7 @@ from ..models import (
     MAX_FORUM_TAGS,
     ChannelKind,
     Feed,
+    Item,
     Level,
     LogEntry,
     OutgoingMessage,
@@ -44,6 +46,7 @@ from ..service import (
 )
 from . import _history as history
 from . import _ui as ui
+from .template import PREVIEW_REFUSED
 
 MESSAGE_CHANNEL_TYPES = (
     discord.ChannelType.text,
@@ -75,12 +78,23 @@ TAG_NEEDED_AGAIN = (
 PAUSED_NOT_REFRESHED = "That Feed is paused. Resume it with `/feed resume` to refresh it."
 EVERYONE_LEFT_OUT = "`@everyone` cannot be a mention role, so it was left out."
 ADDRESS_SHOWN = 200
+CHOICE_TITLE = 100  # characters of an Item's title in a test's list
+HELD_BACK = 5  # how many held-back Items a test names
+HELD_BACK_TITLE = 60
+
+POST_GONE = (
+    "Nothing was posted: the Feed no longer lists that Item, or its Filters now hold it back."
+)
 
 OUTCOME_WORDS = {
-    DeliveryOutcome.DELIVERED: "Posted the newest Item in {channel}.",
+    DeliveryOutcome.DELIVERED: "Posted the Item in {channel}.",
     DeliveryOutcome.RETRY: (
         "Discord did not take the message just now. Nothing was posted in {channel}; "
         "try again in a minute."
+    ),
+    DeliveryOutcome.UNKNOWN: (
+        "Discord did not answer, so the bot cannot tell whether the message was posted in "
+        "{channel}. Check the channel before trying again."
     ),
     DeliveryOutcome.REJECTED: (
         "Discord refused the message, so nothing was posted in {channel}. "
@@ -179,13 +193,22 @@ def _current_channel(interaction: discord.Interaction) -> Any | None:
     return channel
 
 
-def _access_warning(interaction: discord.Interaction, channel_id: int) -> str:
+def _access_warning(
+    interaction: discord.Interaction, channel_id: int, *, embed: bool = False
+) -> str:
     """A warning when the bot cannot post in the channel; nothing when it can or cannot tell."""
-    if ui.bot_can_post(interaction, channel_id) is not False:
+    missing = ui.missing_post_permissions(interaction, channel_id, embed=embed)
+    if not missing:
         return ""
+    mention = ui.channel_mention(channel_id)
+    if {"View Channel", "Send Messages", "Send Messages in Threads"} & set(missing):
+        return (
+            f"**Warning**: the bot cannot see or post in {mention}. "
+            "Nothing will be posted until the bot is given access to it."
+        )
     return (
-        f"**Warning**: the bot cannot see or post in {ui.channel_mention(channel_id)}. "
-        "Nothing will be posted until the bot is given access to it."
+        f"**Warning**: the bot lacks the {' and '.join(missing)} permission in {mention}. "
+        "Posts there may fail until the bot is given it."
     )
 
 
@@ -272,7 +295,7 @@ async def _panel(interaction: discord.Interaction, feed: Feed) -> tuple[str, dis
             f"**Tags**: {len(feed.forum_tag_ids)} · "
             f"**Cover image**: {'on' if feed.forum_cover else 'off'}"
         )
-    warning = _access_warning(interaction, feed.channel_id)
+    warning = _access_warning(interaction, feed.channel_id, embed=feed.embed is not None)
     if warning:
         lines.append(warning)
     pause_or_resume = (
@@ -324,6 +347,10 @@ class BackToPanel(ui.ActionButton, action="feed_panel", ids=1, requires=Level.MA
 
 
 async def _show_settings_form(interaction: discord.Interaction, feed: Feed) -> None:
+    # Discord may refuse a pre-selected channel that was deleted since; the Feed stays bound to it.
+    # Not in the cache is not deleted (an archived thread is dropped too), so with no default
+    # to show the field is optional: leaving it empty keeps the Feed where it is.
+    channel_here = ui.cached_channel(interaction, feed.channel_id) is not None
     await ui.show_form(
         interaction,
         "feed_edit",
@@ -336,7 +363,8 @@ async def _show_settings_form(interaction: discord.Interaction, feed: Feed) -> N
                 "channel",
                 "Channel",
                 channel_types=FEED_CHANNEL_TYPES,
-                default_id=feed.channel_id,
+                default_id=feed.channel_id if channel_here else None,
+                required=channel_here,
                 description="Where the Feed's Items are posted.",
             ),
             ui.choice_field(
@@ -354,10 +382,10 @@ async def _settings_submitted(
     interaction: discord.Interaction, ids: tuple[int, ...], values: ui.FormValues
 ) -> None:
     feed = ui.feed_of(interaction, ids[0])
-    picked = _picked_channel(interaction, values)
+    picked = values.channel("channel")  # None: left empty, the Feed stays in its channel
     interval = _picked_interval(values)
-    moved = picked.id != feed.channel_id
-    kind = _kind_of(interaction, picked) if moved else None
+    moved_to = picked if picked is not None and picked.id != feed.channel_id else None
+    kind = _kind_of(interaction, moved_to) if moved_to else None
     in_place = _from_message(interaction)
     await ui.defer(interaction, update=in_place)
     updated, old_channel_id = await _service(interaction).edit_feed(
@@ -365,7 +393,7 @@ async def _settings_submitted(
         feed.id,
         name=values.text("name"),
         url=values.text("url"),
-        channel_id=picked.id if moved else None,
+        channel_id=moved_to.id if moved_to else None,
         channel_kind=kind,
         interval_s=interval,
         actor=ui.actor_of(interaction),
@@ -699,19 +727,66 @@ def _thread_title(message: OutgoingMessage) -> str:
     return title or DEFAULT_THREAD_TITLE
 
 
-async def _send_preview(interaction: discord.Interaction, feed: Feed) -> None:
-    """Show privately what the Feed would post for the newest Item, then offer to post it."""
+def _item_ref(item: Item) -> int:
+    """A number that stands for the Item in a custom id, which carries only numbers."""
+    return int.from_bytes(hashlib.sha256(item.key.encode()).digest()[:7])
+
+
+def _item_title(item: Item, limit: int) -> str:
+    return discord.utils.escape_markdown(_one_line(item.title, limit)) or "(no title)"
+
+
+def _held_back_line(held_back: Sequence[Item]) -> str:
+    titles = ", ".join(f"*{_item_title(item, HELD_BACK_TITLE)}*" for item in held_back[:HELD_BACK])
+    more = len(held_back) - HELD_BACK
+    return f"Held back by your Filters: {titles}" + (f" and {more} more." if more > 0 else ".")
+
+
+async def _send_preview(
+    interaction: discord.Interaction, feed: Feed, ref: int | None = None
+) -> None:
+    """Show privately what the Feed would post for one of its newest Items, then offer to
+    post it. Only Items the Feed's Filters let through are shown: the newest, or the one
+    `ref` stands for."""
     await ui.defer(interaction)
-    message, _ = await _service(interaction).preview(feed.server_id, feed.id)
+    service = _service(interaction)
+    listing = await service.test_listing(feed.server_id, feed.id)
+    back = BackToPanel(feed.id)
+    if not listing.choices:
+        count = "the only Item" if listing.listed == 1 else f"all {listing.listed} Items"
+        lines = [
+            f"Your Filters hold back {count} that **{_name(feed)}** lists right now, "
+            "so there is nothing to test.",
+            _held_back_line(listing.held_back),
+        ]
+        await ui.reply(interaction, "\n".join(lines), view=ui.view_of(back))
+        return
+    refs = [_item_ref(item) for item in listing.choices]
+    at = refs.index(ref) if ref in refs else 0
+    item = listing.choices[at]
+    message = service.render_item(feed.server_id, feed.id, item)
     embed = build_embed(message.embed, published=message.published)
     content = message.content or (None if embed is not None else "*(no message text)*")
-    await ui.reply(interaction, content, embed=embed, view=build_view(message))
+    try:
+        await ui.reply(interaction, content, embed=embed, view=build_view(message))
+    except discord.HTTPException:
+        await ui.reply(interaction, PREVIEW_REFUSED, view=ui.view_of(back))
+        return
 
     channel = ui.channel_mention(feed.channel_id)
-    lines = [
-        f"Above is the newest Item of **{_name(feed)}** as it would be posted in {channel}. "
+    if at:
+        which = f"Item {at + 1}"
+    elif listing.held_back:
+        which = "the newest Item your Filters let through"
+    else:
+        which = "the newest Item"
+    lines = []
+    if ref is not None and ref not in refs:
+        lines.append("The Item you chose is no longer one the Feed would post.")
+    lines.append(
+        f"Above is {which} of **{_name(feed)}** as it would be posted in {channel}. "
         "Nothing has been posted."
-    ]
+    )
     if feed.channel_kind is ChannelKind.FORUM:
         title = discord.utils.escape_markdown(_thread_title(message))
         lines.append(f"**Forum post title**: {title}")
@@ -719,10 +794,22 @@ async def _send_preview(interaction: discord.Interaction, feed: Feed) -> None:
             lines.append(f"**Cover image**: <{ui.cut(message.cover_image_url, 300)}>")
     if message.username:
         lines.append(f"**Post as**: {discord.utils.escape_markdown(message.username)}")
+    several = len(listing.choices) > 1
+    if several:
+        for number, choice in enumerate(listing.choices, start=1):
+            line = f"{number}. {_item_title(choice, CHOICE_TITLE)}"
+            lines.append(f"**{line}**" if choice is item else line)
+    if listing.held_back:
+        lines.append(_held_back_line(listing.held_back))
     if feed.mention_role_ids:
         roles = ", ".join(ui.role_mention(role_id) for role_id in feed.mention_role_ids)
         lines.append(f"Posting it will mention {roles}.")
-    view = ui.view_of(PostPreview(feed.id), BackToPanel(feed.id))
+    numbers = [
+        PickPreview(feed.id, other, label=str(number), disabled=other == refs[at], row=0)
+        for number, other in enumerate(refs, start=1)
+        if several
+    ]
+    view = ui.view_of(*numbers, PostPreview(feed.id, refs[at], row=1), BackToPanel(feed.id, row=1))
     await ui.reply(interaction, "\n".join(lines), view=view)
 
 
@@ -733,7 +820,18 @@ class TestButton(ui.ActionButton, action="feed_test", ids=1, requires=Level.MANA
         await _send_preview(interaction, ui.feed_of(interaction, self.ids[0]))
 
 
-class PostPreview(ui.ActionButton, action="feed_post", ids=1, requires=Level.MANAGER):
+class PickPreview(ui.ActionButton, action="feed_test_pick", ids=2, requires=Level.MANAGER):
+    """Its second id stands for the Item to show (`_item_ref`)."""
+
+    label = "Item"
+
+    async def handle(self, interaction: discord.Interaction) -> None:
+        await _send_preview(interaction, ui.feed_of(interaction, self.ids[0]), self.ids[1])
+
+
+class PostPreview(ui.ActionButton, action="feed_post", ids=2, requires=Level.MANAGER):
+    """Its second id stands for the Item to post (`_item_ref`)."""
+
     label = "Post to channel"
     style = discord.ButtonStyle.primary
 
@@ -741,15 +839,25 @@ class PostPreview(ui.ActionButton, action="feed_post", ids=1, requires=Level.MAN
         feed = ui.feed_of(interaction, self.ids[0])
         await ui.defer(interaction, update=True)
         shared = ui.deps(interaction)
-        message, _ = await shared.service.preview(feed.server_id, feed.id)
+        listing = await shared.service.test_listing(feed.server_id, feed.id)
+        item = next((i for i in listing.choices if _item_ref(i) == self.ids[1]), None)
+        if item is None:
+            # The source moved on, or a Filter added since holds the Item back.
+            ui.refused(interaction, "the Item is no longer one the Feed would post")
+            view = ui.view_of(TestButton(feed.id, label="Test again"), BackToPanel(feed.id))
+            await ui.edit(interaction, POST_GONE, view=view)
+            return
+        message = shared.service.render_item(feed.server_id, feed.id, item)
         outcome = await shared.deliverer.deliver(feed, message)
+        if outcome is DeliveryOutcome.DELIVERED:  # no Check should post it again
+            await shared.service.record_posted(feed.server_id, feed.id, item)
         words = OUTCOME_WORDS.get(outcome, OUTCOME_WORDS[DeliveryOutcome.RETRY])
         content = words.format(channel=ui.channel_mention(feed.channel_id))
         if outcome is DeliveryOutcome.DELIVERED:
             await ui.edit(interaction, content, view=ui.view_of(BackToPanel(feed.id)))
         else:
-            view = ui.view_of(PostPreview(feed.id, label="Try again"), BackToPanel(feed.id))
-            await ui.edit(interaction, content, view=view)
+            again = PostPreview(feed.id, self.ids[1], label="Try again")
+            await ui.edit(interaction, content, view=ui.view_of(again, BackToPanel(feed.id)))
 
 
 # -- Refresh --
@@ -1245,12 +1353,16 @@ async def pause_command(interaction: discord.Interaction, feed: str) -> None:
 async def resume_command(interaction: discord.Interaction, feed: str) -> None:
     ui.require_manager(interaction)
     found = ui.feed_from_option(interaction, feed)
+    if found.paused is None:
+        raise ui.UserError("That Feed is not paused.")
     resumed = await _service(interaction).resume_feed(
         found.server_id, found.id, actor=ui.actor_of(interaction)
     )
     lines = [f"Resumed the Feed **{_name(resumed)}**. It is checked again from now on."]
     if found.paused is PauseReason.LOST_CHANNEL:
-        lines.append(_access_warning(interaction, resumed.channel_id))
+        lines.append(
+            _access_warning(interaction, resumed.channel_id, embed=resumed.embed is not None)
+        )
     elif _needs_tag_again(found.paused, resumed):
         lines.append(TAG_NEEDED_AGAIN)
     await ui.reply(interaction, "\n".join(filter(None, lines)))
@@ -1283,7 +1395,7 @@ async def refresh_command(interaction: discord.Interaction, feed: str | None = N
     await ui.reply(interaction, await _refresh(interaction, found))
 
 
-@group.command(name="test", description="Preview what a Feed would post for its newest Item.")
+@group.command(name="test", description="Preview what a Feed would post for one of its Items.")
 @app_commands.describe(feed="The Feed to test.")
 @app_commands.autocomplete(feed=ui.feed_autocomplete)
 async def test_command(interaction: discord.Interaction, feed: str) -> None:

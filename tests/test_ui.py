@@ -638,7 +638,7 @@ async def test_autocomplete_lists_this_servers_feeds_by_substring(db: Database) 
     interaction = FakeInteraction(db, channels=(FakeChannel(7, "feeds"),))
 
     choices = await ui.feed_autocomplete(interaction, " NEWS ")
-    assert [(c.name, c.value) for c in choices] == [("Daily News (#feeds)", str(news.id))]
+    assert [(c.name, c.value) for c in choices] == [("Daily News (#feeds)", ui.feed_value(news.id))]
     assert len(await ui.feed_autocomplete(interaction, "")) == 2
     assert await ui.feed_autocomplete(interaction, "zzz") == []
 
@@ -648,7 +648,7 @@ async def test_autocomplete_also_matches_the_address(db: Database) -> None:
     add_feed(db, "Comics")
     interaction = FakeInteraction(db, administrator=True)
     choices = await ui.feed_autocomplete(interaction, "BLOG.example")
-    assert [(c.name, c.value) for c in choices] == [("Daily News", str(feed.id))]
+    assert [(c.name, c.value) for c in choices] == [("Daily News", ui.feed_value(feed.id))]
 
 
 async def test_autocomplete_tells_same_named_feeds_apart(db: Database) -> None:
@@ -666,7 +666,7 @@ async def test_autocomplete_tells_same_named_feeds_apart(db: Database) -> None:
     interaction = FakeInteraction(db, administrator=True, channels=channels)
 
     choices = await ui.feed_autocomplete(interaction, "")
-    assert [c.value for c in choices] == [str(feed.id) for feed in [feeds[6], *feeds[:6]]]
+    assert [c.value for c in choices] == [ui.feed_value(feed.id) for feed in [feeds[6], *feeds[:6]]]
     names = [c.name for c in choices]
     assert names == [
         "Comics (#feeds)",
@@ -710,9 +710,10 @@ async def test_autocomplete_shows_nothing_without_access_or_on_failure(db: Datab
 
 def test_feed_option_parsing(db: Database) -> None:
     feed = add_feed(db, "News")
-    assert ui.parse_feed_option(f" {feed.id} ") == feed.id
-    assert ui.feed_from_option(FakeInteraction(db), str(feed.id)) == feed
-    for typed in ("News", "", "-1", "1.5", "0x1", "99999999999999999999"):
+    assert ui.parse_feed_option(f" {ui.feed_value(feed.id)} ") == feed.id
+    assert ui.feed_from_option(FakeInteraction(db), ui.feed_value(feed.id)) == feed
+    # A number typed by hand is not a picked Feed.
+    for typed in (str(feed.id), "News", "", "id:", "id:-1", "id:1.5", "id:0x1", "id:" + "9" * 20):
         with pytest.raises(ui.UserError, match="Choose a Feed"):
             ui.parse_feed_option(typed)
 
@@ -778,6 +779,44 @@ def test_bot_can_post(db: Database) -> None:
     assert ui.bot_can_post(interaction, 1) is True
     assert ui.bot_can_post(interaction, 2) is False
     assert ui.bot_can_post(interaction, 3) is None
+
+
+def test_bot_can_post_needs_the_permissions_the_channel_and_message_ask_for(db: Database) -> None:
+    channels = (
+        FakeChannel(1, lacking=("embed_links",)),
+        FakeChannel(
+            2, type=discord.ChannelType.public_thread, lacking=("send_messages_in_threads",)
+        ),
+        FakeChannel(3, lacking=("send_messages_in_threads",)),
+    )
+    interaction = FakeInteraction(db, channels=channels)
+    assert ui.bot_can_post(interaction, 1) is True  # no Embed is posted
+    assert ui.bot_can_post(interaction, 1, embed=True) is False
+    assert ui.missing_post_permissions(interaction, 1, embed=True) == ["Embed Links"]
+    assert ui.bot_can_post(interaction, 2) is False
+    assert ui.missing_post_permissions(interaction, 2) == ["Send Messages in Threads"]
+    assert ui.bot_can_post(interaction, 3) is True  # only threads need that permission
+    assert ui.missing_post_permissions(interaction, 4) is None
+
+
+def test_a_thread_needs_send_messages_in_threads_not_send_messages(db: Database) -> None:
+    thread = discord.ChannelType.public_thread
+    channels = (
+        FakeChannel(1, type=thread, lacking=("send_messages",)),
+        FakeChannel(2, type=thread, lacking=("send_messages_in_threads",)),
+        FakeChannel(3, type=thread, lacking=("view_channel", "send_messages_in_threads")),
+        FakeChannel(4, lacking=("send_messages",)),
+    )
+    interaction = FakeInteraction(db, channels=channels)
+    # The usual read-only channel with discussion in threads: the parent denies Send Messages.
+    assert ui.missing_post_permissions(interaction, 1) == []
+    assert ui.bot_can_post(interaction, 1) is True
+    assert ui.missing_post_permissions(interaction, 2) == ["Send Messages in Threads"]
+    assert ui.missing_post_permissions(interaction, 3) == [
+        "View Channel",
+        "Send Messages in Threads",
+    ]
+    assert ui.missing_post_permissions(interaction, 4) == ["Send Messages"]
 
 
 # -- Pop-up forms --

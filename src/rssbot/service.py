@@ -18,6 +18,7 @@ import contextlib
 import enum
 import logging
 import random
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
@@ -26,7 +27,7 @@ from urllib.parse import urlsplit
 
 from . import template as tpl
 from .db import Database, FeedNotFound
-from .filters import normalise_word
+from .filters import normalise_word, passes
 from .identity import SiteIdentity, discover
 from .journal import Journal
 from .models import (
@@ -82,6 +83,7 @@ MAX_URL_CHARS = 2000
 MAX_FORUM_TITLE_TEMPLATE_CHARS = 200
 MAX_MENTION_ROLES = 10
 MAX_FILTERS = 100
+TEST_CHOICES = 5  # how many Items a test offers to choose from
 MAX_FILTER_WORD_CHARS = 100
 MAX_IMPORT_FEEDS = 100
 IMPORT_CONCURRENCY = 5
@@ -95,6 +97,8 @@ _PAUSE_WORDS = {
     PauseReason.LOST_CHANNEL: "the bot can no longer post in its channel",
     PauseReason.NEEDS_TAG: "the forum requires a tag and the Feed has none",
 }
+
+NO_ITEMS = "The Feed does not list any Items right now."
 
 _LIST_WORDS = {FilterList.MUST_HAVE: "must-have", FilterList.BLOCK: "block"}
 
@@ -121,6 +125,15 @@ class RemovedFeed:
     feed: Feed  # as it was
     channel_id: int
     webhook_in_use: bool  # another Feed in that channel still posts through the webhook
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewListing:
+    """What a test of a Feed can show, newest first."""
+
+    choices: tuple[Item, ...]  # the newest Items its Filters let through, at most TEST_CHOICES
+    held_back: tuple[Item, ...]  # every Item its Filters would stop a Check from posting
+    listed: int  # how many Items the source lists
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,10 +311,7 @@ class FeedService:
         else:
             custom_name = custom_avatar = ""
         self._refuse_duplicate(channel_id, url)
-        if self._db.count_feeds(server_id) >= MAX_FEEDS_PER_SERVER:
-            raise ServiceError(
-                f"This Server already has {MAX_FEEDS_PER_SERVER} Feeds, the most allowed."
-            )
+        self._refuse_past_the_limit(server_id)
 
         parsed, result = await self._read(url)
         identity = None
@@ -310,6 +320,7 @@ class FeedService:
 
         # Nothing is awaited from here on, so the Feed and its Seen items appear together.
         self._refuse_duplicate(channel_id, url)
+        self._refuse_past_the_limit(server_id)  # others may have been added during the fetch
         now = self._clock.now()
         feed = self._db.create_feed(
             server_id=server_id,
@@ -379,6 +390,8 @@ class FeedService:
             if feed.post_as is PostAs.SITE:
                 identity = await discover(parsed, new_url, self._fetcher)
             feed = self.get_feed(server_id, feed_id)  # it may have changed meanwhile
+            if channel_id is None:
+                target_channel = feed.channel_id
             self._refuse_duplicate(target_channel, new_url, but=feed.id)
 
         now = self._clock.now()
@@ -388,7 +401,8 @@ class FeedService:
             changes["name"] = new_name
         if new_interval is not None and new_interval != feed.interval_s:
             changes["interval_s"] = new_interval
-            changes["next_check_at"] = min(feed.next_check_at, now + new_interval)
+            if feed.rate_limited_since is None:  # else its source asked for the wait
+                changes["next_check_at"] = min(feed.next_check_at, now + new_interval)
         if parsed is not None and result is not None:
             changes.update(
                 url=new_url,
@@ -414,13 +428,16 @@ class FeedService:
             changes.update(channel_id=target_channel, forum_tag_ids=())
             if feed.paused in (PauseReason.LOST_CHANNEL, PauseReason.NEEDS_TAG):
                 changes["paused"] = None
-                changes.setdefault("next_check_at", now)
+                due = max(feed.next_check_at, now) if feed.rate_limited_since is not None else now
+                changes.setdefault("next_check_at", due)
         if channel_kind is not None and ChannelKind(channel_kind) != feed.channel_kind:
             changes["channel_kind"] = ChannelKind(channel_kind)
 
-        updated = self._update(feed.id, **changes)
         if parsed is not None:
+            # First, so that a failing write leaves the old address: the new one without its
+            # starting point would post everything the source lists. Extra Seen items are harmless.
             self._baseline(feed.id, parsed, now)
+        updated = self._update(feed.id, **changes)
         edits = _edits(feed, updated)
         if edits:
             # Moved out of the channel the bot had paused it over, it is checked again.
@@ -439,7 +456,10 @@ class FeedService:
         if feed.paused is PauseReason.MANUAL:
             return feed
         updated = self._update(feed.id, paused=PauseReason.MANUAL)
-        self._log(actor, LogKind.FEED_PAUSED, updated)
+        detail = ""
+        if feed.paused is not None:  # the bot's pause, whose reason the member's replaces
+            detail = f"Replaced the bot's pause: {pause_cause(feed.paused)}."
+        self._log(actor, LogKind.FEED_PAUSED, updated, detail=detail)
         return updated
 
     async def resume_feed(self, server_id: int, feed_id: int, *, actor: Actor) -> Feed:
@@ -480,6 +500,47 @@ class FeedService:
         except Exception as exc:
             log.warning("Feed %s: the preview could not be rendered", feed.id, exc_info=True)
             raise ServiceError("The newest Item could not be made into a message.") from exc
+
+    async def test_listing(self, server_id: int, feed_id: int) -> PreviewListing:
+        """The source's Items a test may show and post, and those the Feed's Filters hold back.
+
+        Changes nothing.
+        """
+        feed = self.get_feed(server_id, feed_id)
+        parsed, _ = await self._read(feed.url)
+        if not parsed.items:
+            raise ServiceError(NO_ITEMS)
+        filters = self._db.list_filters(feed.id)
+        choices: list[Item] = []
+        held_back: list[Item] = []
+        for item in _newest_first(parsed.items):
+            if not self._wanted(feed, item, filters):
+                held_back.append(item)
+            elif len(choices) < TEST_CHOICES:
+                choices.append(item)
+        return PreviewListing(tuple(choices), tuple(held_back), len(parsed.items))
+
+    def render_item(self, server_id: int, feed_id: int, item: Item) -> OutgoingMessage:
+        """One of the source's Items as the Feed would post it now."""
+        feed = self.get_feed(server_id, feed_id)
+        try:
+            return self._render(feed, item)
+        except Exception as exc:
+            log.warning("Feed %s: an Item could not be rendered", feed.id, exc_info=True)
+            raise ServiceError("That Item could not be made into a message.") from exc
+
+    def _wanted(self, feed: Feed, item: Item, filters: Sequence[Filter]) -> bool:
+        try:
+            return passes(item, filters)
+        except Exception:
+            # As in a Check: Filters that cannot be applied let the Item through.
+            log.warning("Feed %s: could not apply the Filters to an Item", feed.id, exc_info=True)
+            return True
+
+    async def record_posted(self, server_id: int, feed_id: int, item: Item) -> None:
+        """Record an Item posted outside a Check as delivered, so that no Check posts it again."""
+        feed = self.get_feed(server_id, feed_id)
+        self._db.record_seen(feed.id, [(item.key, ItemStatus.DELIVERED)], self._clock.now())
 
     async def placeholder_values(self, server_id: int, feed_id: int) -> list[tuple[str, str]]:
         """Every Placeholder with its value for the newest Item, cut short.
@@ -580,9 +641,8 @@ class FeedService:
         if feed.embed is None or not 1 <= position <= len(fields):
             raise ServiceError(f"There is no Field number {position}.")
         kept = fields[: position - 1] + fields[position:]
-        return self._change_template(
-            actor, feed, f"removed Field {position}", embed=replace(feed.embed, fields=kept)
-        )
+        embed = replace(feed.embed, fields=kept)
+        return self._change_template(actor, feed, f"removed Field {position}", embed=embed)
 
     async def add_button(
         self, server_id: int, feed_id: int, label: str, url: str, *, actor: Actor
@@ -709,7 +769,9 @@ class FeedService:
             raise ServiceError(f"A Forum post can have at most {MAX_FORUM_TAGS} tags.")
         changes: dict[str, Any] = {"forum_tag_ids": ids}
         if ids and feed.paused is PauseReason.NEEDS_TAG:
-            changes.update(paused=None, next_check_at=self._clock.now())
+            now = self._clock.now()
+            due = max(feed.next_check_at, now) if feed.rate_limited_since is not None else now
+            changes.update(paused=None, next_check_at=due)
         updated = self._update(feed.id, **changes)
         resumed = "paused" in changes
         if ids != feed.forum_tag_ids:
@@ -857,6 +919,9 @@ class FeedService:
 
     def _change_template(self, actor: Actor, feed: Feed, what: str, **changes: Any) -> Feed:
         """Store a change to the Template. `what` names the part, never its text."""
+        embed = changes.get("embed")
+        if embed is not None and embed.is_empty:
+            changes["embed"] = None  # as in render: nothing to show, so no Embed is posted
         updated = self._update(feed.id, **changes)
         if any(getattr(feed, name) != value for name, value in changes.items()):
             self._log(actor, LogKind.TEMPLATE_CHANGED, updated, detail=what)
@@ -922,6 +987,12 @@ class FeedService:
             if feed.url == url and feed.id != but:
                 raise DuplicateFeed("That channel already has a Feed for that address.")
 
+    def _refuse_past_the_limit(self, server_id: int) -> None:
+        if self._db.count_feeds(server_id) >= MAX_FEEDS_PER_SERVER:
+            raise ServiceError(
+                f"This Server already has {MAX_FEEDS_PER_SERVER} Feeds, the most allowed."
+            )
+
     def _baseline(self, feed_id: int, parsed: ParsedFeed, now: int) -> None:
         """Record everything the source lists as Seen, so that none of it is posted.
 
@@ -941,7 +1012,9 @@ class FeedService:
         if result.not_modified:
             raise ServiceError("The Feed could not be fetched.")
         try:
-            parsed = await asyncio.to_thread(self._parse, result.body, result.url or url)
+            parsed = await asyncio.to_thread(
+                self._parse, result.body, result.url or url, result.content_type
+            )
         except ParseError as exc:
             log.info("No feed from %s: %s", _host(url) or "that address", exc)
             raise ServiceError(str(exc) or "That address did not return a feed.") from exc
@@ -953,11 +1026,8 @@ class FeedService:
     async def _newest(self, feed: Feed) -> Item:
         parsed, _ = await self._read(feed.url)
         if not parsed.items:
-            raise ServiceError("The Feed does not list any Items right now.")
-        dated = [item for item in parsed.items if item.published is not None]
-        if not dated:
-            return parsed.items[0]
-        return max(dated, key=lambda item: item.published or 0)  # the first of equals
+            raise ServiceError(NO_ITEMS)
+        return _newest_first(parsed.items)[0]
 
     async def _discover(self, feed: Feed) -> SiteIdentity:
         """The site's identity. A source that cannot be read is stood in for by what is stored."""
@@ -990,6 +1060,11 @@ def _picture(feed: Feed) -> str:
     return {PostAs.SITE: feed.site_icon, PostAs.CUSTOM: feed.custom_avatar}.get(feed.post_as, "")
 
 
+def _newest_first(items: Sequence[Item]) -> list[Item]:
+    """By date, the first listed of equals first; Items without a date follow as listed."""
+    return sorted(items, key=lambda item: (item.published is None, -(item.published or 0)))
+
+
 def _filters_detail(did: str, filters: Sequence[Filter]) -> str:
     """ "added block Filter "sponsored"", "removed must-have Filter "linux" (title only)"."""
     first = filters[0]
@@ -1007,7 +1082,7 @@ def _clean_url(url: str) -> str:
     url = url.strip()
     if not url:
         raise ServiceError("The Feed address cannot be empty.")
-    if "://" not in url:
+    if not re.match(r"[^/?#]*://", url):  # a "://" later on is part of the path or query
         url = "https://" + url
     if len(url) > MAX_URL_CHARS:
         raise ServiceError(f"The Feed address can be at most {MAX_URL_CHARS} characters long.")

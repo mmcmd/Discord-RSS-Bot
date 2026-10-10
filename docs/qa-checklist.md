@@ -67,8 +67,9 @@ The Feed panel (open one with `/feed edit feed:<name>`):
 - [ ] On the forum Feed: **Forum options** -> Forum post title, Tags, Cover image, a menu **Choose the tags put on every Forum post**, **Post title**, **Cover image: Off** and **Back to Feed**. Pick a tag -> the panel shows Tags: 1.
 - [ ] **Forum options** -> **Post title** -> form **Forum post title**; submit `{{title}} ({{feed_title}})` -> the panel shows it.
 - [ ] **Forum options** -> **Cover image: Off** -> the panel shows Cover image: on; **Forum options** now has **Cover image: On**. **Back to Feed** -> the panel.
-- [ ] **Test** -> two new messages: the newest Item as it would look, then "Above is the newest Item of **...** as it would be posted in #... Nothing has been posted." with **Post to channel** and **Back to Feed**. With a mention role set, the note ends "Posting it will mention @role."
-- [ ] **Post to channel** -> "Posted the newest Item in #..." with **Back to Feed**; the Item is in the channel and the role was pinged. **Back to Feed** -> the panel.
+- [ ] **Test** -> two new messages: the newest Item as it would look, then "Above is the newest Item of **...** as it would be posted in #... Nothing has been posted.", a numbered list of the five newest Items with the first in bold, buttons **1** to **5** (**1** greyed out), **Post to channel** and **Back to Feed**. With a mention role set, the note ends "Posting it will mention @role."
+- [ ] Press **3** -> two more messages: the third Item as it would look, then "Above is Item 3 of **...**" with the third line in bold and **3** greyed out. **Post to channel** there posts the third Item.
+- [ ] **Post to channel** -> "Posted the Item in #..." with **Back to Feed**; the Item is in the channel and the role was pinged. **Back to Feed** -> the panel.
 - [ ] **Test** on the Feed in the private channel, then **Post to channel** -> "The bot cannot post in #... Check that the channel still exists and that the bot may see it and post in it." with **Try again** and **Back to Feed**; both work.
 - [ ] **Pause** -> Status "Paused: by a member" and the button is now **Resume**. **Resume** -> Status "Working" and the button is **Pause** again.
 - [ ] **Remove** -> "Remove the Feed **...** from #...? Its Template and Filters are removed with it. This cannot be undone." with **Remove** and **Cancel**. **Cancel** -> the panel is back.
@@ -133,6 +134,7 @@ The other `/feed` commands:
 - [ ] **Add block words** with Look in **Title** -> the word is listed with "(title)".
 - [ ] **Add block words** with a word that is already a must-have word (same Look in) -> "“...” is already a must-have word for this Feed. Remove it there first." and nothing added.
 - [ ] Submit a word that is already in the same list -> "Nothing was added: the words were blank or already in the list."
+- [ ] Add a block word that the Feed's newest Item contains, then **Test** on the panel -> the preview is of the newest Item without the word ("Above is the newest Item your Filters let through of **...**"), no number stands for the blocked Item, and the note has "Held back by your Filters: *<its title>*." Add a must-have word that no Item contains -> **Test** shows no preview and no **Post to channel**: "Your Filters hold back all N Items that **...** lists right now, so there is nothing to test." Remove both words again.
 - [ ] **Remove a word**, pick one -> "Removed “...” from the block words." **Back to Feed** -> the panel shows the new Filters count.
 - [ ] On a Feed that posts often, add a block word that appears only inside link addresses of its Items (for example `www` or `reddit`) -> new Items are still posted.
 - [ ] Add a block word that appears in the visible title of most Items -> those Items are not posted, and they do not appear later when you remove the word.

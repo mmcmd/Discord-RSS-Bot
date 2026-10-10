@@ -134,7 +134,7 @@ def test_billion_laughs_is_rejected() -> None:
 
 
 def test_entity_declaration_without_doctype_check_in_utf16_is_rejected() -> None:
-    text = BILLION_LAUGHS.decode().replace("<?xml version=\"1.0\"?>", "")
+    text = BILLION_LAUGHS.decode().replace('<?xml version="1.0"?>', "")
     with pytest.raises(OpmlError):
         parse_opml(text.encode("utf-16"))
 
@@ -220,7 +220,7 @@ def test_duplicates_do_not_count_towards_the_entry_limit() -> None:
 NASTY = [
     OpmlEntry("Plain", "https://example.com/feed"),
     OpmlEntry('Fish & "Chips" <live>', "https://example.com/feed?a=1&b=2&c=<x>"),
-    OpmlEntry("It's \"quoted\"", "https://example.com/it's?q=\"x\""),
+    OpmlEntry('It\'s "quoted"', 'https://example.com/it\'s?q="x"'),
     OpmlEntry("Ünïcödé 日本語 🎉", "https://例え.jp/フィード?名=値"),
     OpmlEntry("&amp; &lt; already-escaped", "https://example.com/&amp;"),
     OpmlEntry("Tab\tand\nnewline", "https://example.com/multi"),
@@ -238,11 +238,11 @@ def test_round_trip_at_the_entry_limit() -> None:
 
 
 def test_build_output_shape() -> None:
-    out = build_opml([OpmlEntry("A & B", "https://e.com/f?x=1&y=2")], "My \"feeds\"")
+    out = build_opml([OpmlEntry("A & B", "https://e.com/f?x=1&y=2")], 'My "feeds"')
     text = out.decode("utf-8")
     assert text.startswith('<?xml version="1.0" encoding="UTF-8"?>')
     assert '<opml version="2.0">' in text
-    assert "<title>My \"feeds\"</title>" in text
+    assert '<title>My "feeds"</title>' in text
     assert (
         '<outline type="rss" text="A &amp; B" title="A &amp; B" xmlUrl="https://e.com/f?x=1&amp;y=2"/>'
     ) in text
@@ -258,3 +258,37 @@ def test_build_with_no_entries_is_valid_xml_but_has_no_feeds() -> None:
     assert out.startswith(b"<?xml")
     with pytest.raises(OpmlError, match="any feeds"):
         parse_opml(out)
+
+
+# --- review fixes ---
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("feed://a.com/rss", "http://a.com/rss"),
+        ("feed:https://b.com/rss", "https://b.com/rss"),
+        ("feed:http://c.com/rss", "http://c.com/rss"),
+        ("FEED://d.com/rss", "http://d.com/rss"),
+    ],
+)
+def test_feed_scheme_urls_are_rewritten(given: str, expected: str) -> None:
+    data = f'<opml><body><outline text="X" xmlUrl="{given}"/></body></opml>'.encode()
+    assert parse_opml(data) == [OpmlEntry(title="X", url=expected)]
+
+
+@pytest.mark.parametrize("encoding", ["gb2312", "gbk", "shift_jis", "euc-kr", "big5"])
+def test_multibyte_encodings_are_decoded(encoding: str) -> None:
+    text = {
+        "gb2312": "中文",
+        "gbk": "中文",
+        "shift_jis": "日本語",
+        "euc-kr": "한국어",
+        "big5": "中文",
+    }
+    title = text[encoding]
+    data = (
+        f'<?xml version="1.0" encoding="{encoding}"?><opml><body>'
+        f'<outline text="{title}" xmlUrl="https://a.com/rss"/></body></opml>'
+    ).encode(encoding)
+    assert parse_opml(data) == [OpmlEntry(title=title, url="https://a.com/rss")]

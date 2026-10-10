@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from .models import (
@@ -45,6 +45,8 @@ class FetchResult:
     etag: str | None
     last_modified: str | None
     url: str  # after redirects
+    # The Content-Type header, so that its charset reaches the parser. Not part of equality.
+    content_type: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,9 @@ class DeliveryOutcome(enum.Enum):
     REJECTED = "rejected"  # Discord refused this message's content; resending it cannot help
     LOST_CHANNEL = "lost_channel"  # the channel is gone or the bot may not post there
     NEEDS_TAG = "needs_tag"  # the forum requires a tag and the message has none
+    # The request may have reached Discord and there was no answer to say whether it took the
+    # message (connection lost, timeout). Sending again could post twice: the Item is skipped.
+    UNKNOWN = "unknown"
 
 
 class Deliverer(Protocol):
@@ -102,5 +107,6 @@ class Clock(Protocol):
     async def sleep(self, seconds: float) -> None: ...
 
 
-ParseFn = Callable[[bytes, str], ParsedFeed]  # (body, feed url); raises ParseError
+# (body, feed url, content type); raises ParseError
+ParseFn = Callable[[bytes, str, str], ParsedFeed]
 RenderFn = Callable[[Feed, Item], OutgoingMessage]

@@ -27,7 +27,7 @@ Copy `setup.py`. Import the toolkit as `from . import _ui as ui`. Tests use `tes
 @app_commands.autocomplete(feed=ui.feed_autocomplete)
 async def feeds_command(interaction: discord.Interaction, feed: str) -> None:
     ui.require_manager(interaction)
-    found = ui.feed_from_option(interaction, feed)   # option value is the Feed id as a string
+    found = ui.feed_from_option(interaction, feed)   # option value is `ui.feed_value(id)`, set by autocomplete
     await ui.reply(interaction, f"{found.name} in {ui.channel_mention(found.channel_id)}")
 
 def register(tree: app_commands.CommandTree) -> None:    # the convention: one per module

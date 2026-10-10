@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import random
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -260,6 +262,43 @@ def test_keys_do_not_change_when_an_unrelated_entry_is_added() -> None:
     assert [item.key for item in after.items][1:] == keys
     assert [item.key for item in middle.items if item.title != "Brand new"] == keys
     assert after.items[0].key not in keys
+
+
+# Last-resort keys, as the version before the Atom content fix made them (the "text" key hashes
+# what feedparser calls the summary): an Item that has one must not be posted again.
+@pytest.mark.parametrize(
+    ("entry", "key"),
+    [
+        (
+            '<title>T</title><content type="text">if x&lt;y then</content>',
+            "650f55e089ecd43e1979db675190b9f0",
+        ),
+        (
+            "<title>T</title><content>if x&lt;y then</content>",
+            "650f55e089ecd43e1979db675190b9f0",
+        ),
+        (
+            '<title>T</title><content type="text">a &amp;amp; b &lt;b&gt;</content>',
+            "d93f375595cc25a01132aea494a1f75e",
+        ),
+        (
+            '<content type="text">if x&lt;y then</content>',
+            "9297893ebebc7fe5d2e77f689484e1f7",
+        ),
+        (
+            '<title type="html">&lt;b&gt;T&lt;/b&gt;</title><content type="text">a&lt;b</content>',
+            "1f23f0e4b2bc3e8c32cde85805e766f4",
+        ),
+    ],
+)
+def test_the_last_resort_key_of_an_atom_entry_with_only_content_is_unchanged(
+    entry: str, key: str
+) -> None:
+    body = (
+        f'<feed xmlns="http://www.w3.org/2005/Atom"><title>F</title><entry>{entry}</entry></feed>'
+    )
+    (item,) = parse_feed(body.encode(), BASE).items
+    assert item.key == key
 
 
 def test_key_follows_the_guid_not_the_rest() -> None:
@@ -525,6 +564,18 @@ def test_entity_text_that_declares_nothing_is_not_expanded(prolog: str) -> None:
     assert len(title) < 100
 
 
+@pytest.mark.parametrize("count", [1, 16_000])
+def test_attribute_defaults_declared_before_the_root_are_refused(count: int) -> None:
+    """Each is given to every such tag, so thousands parse like thousands of attributes."""
+    defaults = " ".join(f'a{n} CDATA "1>"' for n in range(count))
+    body = _entity_bomb(f"<!DOCTYPE rss [<!ATTLIST title {defaults}>]>").replace("&a;", "T")
+    started = time.monotonic()
+    with pytest.raises(ParseError) as caught:
+        parse_feed(body.encode(), BASE)
+    assert str(caught.value) == REFUSED
+    assert time.monotonic() - started < 1.0
+
+
 def test_a_doctype_without_entities_is_fine() -> None:
     body = _entity_bomb('<!DOCTYPE rss PUBLIC "-//Netscape//DTD RSS 0.91//EN" "x.dtd">')
     assert parse_feed(body.replace("&a;", "T").encode(), BASE).title == "TTTT"
@@ -576,3 +627,263 @@ def test_undated_items_in_a_long_listing_stay_with_their_neighbours() -> None:
 def test_a_file_name_as_body_is_not_opened() -> None:
     with pytest.raises(ParseError):
         parse_feed(str(FIXTURES / "rss20.xml").encode(), BASE)
+
+
+# --- review fixes ---
+
+
+def test_http_charset_is_honoured_without_an_xml_declaration() -> None:
+    xml = (
+        "<rss version='2.0'><channel><title>Feed</title>"
+        "<item><title>Привет мир</title><guid>1</guid></item></channel></rss>"
+    )
+    body = xml.encode("koi8-r")
+    feed = parse_feed(body, BASE, content_type="text/xml; charset=koi8-r")
+    assert feed.items[0].title == "Привет мир"
+
+
+def test_xml_base_applies_to_links_in_item_text() -> None:
+    body = b"""<feed xmlns="http://www.w3.org/2005/Atom"><title>F</title>
+    <entry><id>1</id><title>T</title>
+    <summary type="html" xml:base="https://other.example/a/">
+    &lt;a href="x.html"&gt;go&lt;/a&gt; &lt;img src="p.png"&gt;</summary>
+    </entry></feed>"""
+    item = parse_feed(body, BASE).items[0]
+    assert "(https://other.example/a/x.html)" in item.summary
+    assert item.image == "https://other.example/a/p.png"
+
+
+# Atom content without a summary
+
+
+def atom_entry(entry: str, feed_attributes: str = "") -> bytes:
+    return (
+        f'<feed xmlns="http://www.w3.org/2005/Atom"{feed_attributes}><title>F</title>'
+        f"<entry><id>1</id><title>T</title>{entry}</entry></feed>"
+    ).encode()
+
+
+def test_atom_content_without_a_summary_keeps_its_own_base() -> None:
+    body = atom_entry(
+        '<content type="html">&lt;p&gt;See &lt;a href="/more.html"&gt;more&lt;/a&gt;&lt;/p&gt;'
+        "</content>",
+        feed_attributes=' xml:base="https://blog.example.org/"',
+    )
+    (item,) = parse_feed(body, "https://feeds.feedburner.com/example").items
+    assert item.summary == "See [more](https://blog.example.org/more.html)"
+    assert item.content == ""
+
+
+def test_atom_plain_text_content_without_a_summary_keeps_its_type() -> None:
+    body = atom_entry('<content type="text">if x&lt;y and y&gt;z then 1 &lt; 2</content>')
+    (item,) = parse_feed(body, BASE).items
+    assert item.summary == "if x<y and y>z then 1 < 2"
+    assert item.content == ""
+
+
+def test_rss_description_and_content_encoded_stay_apart() -> None:
+    body = (
+        b"<rss version='2.0' xmlns:content='http://purl.org/rss/1.0/modules/content/'>"
+        b"<channel><title>T</title><item><guid>1</guid><description>Short</description>"
+        b"<content:encoded><![CDATA[<p>Full text</p>]]></content:encoded></item>"
+        b"<item><guid>2</guid>"
+        b"<content:encoded><![CDATA[<p>Only full</p>]]></content:encoded></item>"
+        b"</channel></rss>"
+    )
+    first, second = parse_feed(body, BASE).items
+    assert (first.summary, first.content) == ("Short", "Full text")
+    assert (second.summary, second.content) == ("Only full", "")
+
+
+# An opaque guid is not a link
+
+
+def test_an_opaque_guid_is_not_taken_for_the_items_link() -> None:
+    body = rss("<item><title>Ep 1</title><guid>c0ffee-0001</guid></item>")
+    (item,) = parse_feed(body, "https://feeds.example.net/pod/rss.xml").items
+    assert item.link == ""
+
+
+def test_an_opaque_guid_still_keys_the_item_the_same_way() -> None:
+    with_link = rss("<item><title>Ep</title><guid>c0ffee-0001</guid><link>/ep</link></item>")
+    without = rss("<item><title>Ep</title><guid>c0ffee-0001</guid></item>")
+    assert parse_feed(with_link, BASE).items[0].key == parse_feed(without, BASE).items[0].key
+
+
+@pytest.mark.parametrize(
+    ("guid", "link"),
+    [
+        pytest.param(
+            "<guid>https://example.com/p/3</guid>", "https://example.com/p/3", id="url-guid"
+        ),
+        pytest.param(
+            "<guid isPermaLink='true'>https://example.com/p/3</guid>",
+            "https://example.com/p/3",
+            id="permalink",
+        ),
+        pytest.param(
+            "<guid>c0ffee-1</guid><link>/p/3</link>", "https://base.example/p/3", id="own-link"
+        ),
+        pytest.param(
+            "<guid isPermaLink='true'>/posts/1</guid>",
+            "https://base.example/posts/1",
+            id="relative",
+        ),
+        pytest.param(
+            "<guid>//example.com/posts/1</guid>",
+            "https://example.com/posts/1",
+            id="protocol-relative",
+        ),
+    ],
+)
+def test_a_guid_that_is_a_link_still_gives_the_link(guid: str, link: str) -> None:
+    (item,) = parse_feed(rss(f"<item><title>E</title>{guid}</item>"), BASE).items
+    assert item.link == link
+
+
+@pytest.mark.parametrize(
+    "guid",
+    ["urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8", "tag:example.com,2024:post-1", "c0ffee-0001"],
+)
+def test_an_opaque_guid_of_any_form_is_not_a_link(guid: str) -> None:
+    (item,) = parse_feed(rss(f"<item><title>E</title><guid>{guid}</guid></item>"), BASE).items
+    assert item.link == ""
+
+
+# Long attribute values
+
+
+def test_a_long_data_uri_in_atom_xhtml_content_parses() -> None:
+    image = "data:image/png;base64," + "A" * 27_000
+    body = atom_entry(
+        '<content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p>Hi</p>'
+        f'<img src="{image}"/></div></content>'
+    )
+    (item,) = parse_feed(body, BASE).items
+    assert item.summary.startswith("Hi")
+
+
+def test_a_long_enclosure_url_parses() -> None:
+    url = "https://cdn.example.com/a.mp3?sig=" + "a" * 17_000
+    body = rss(
+        f'<item><title>E</title><guid>1</guid><enclosure type="audio/mpeg" url="{url}"/></item>'
+    )
+    (item,) = parse_feed(body, BASE).items
+    assert item.title == "E"
+
+
+def test_a_tag_with_thousands_of_attributes_is_refused() -> None:
+    attributes = " ".join(f'a{n}="1"' for n in range(1_500))
+    body = rss(f"<item {attributes}><guid>1</guid></item>")
+    with pytest.raises(ParseError) as caught:
+        parse_feed(body, BASE)
+    assert str(caught.value) == REFUSED
+
+
+def _hidden_attributes(value: str) -> str:
+    return " ".join(f"a{n}={value}" for n in range(1_500))
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        _hidden_attributes('">"'),
+        _hidden_attributes("'>'"),
+        _hidden_attributes("'\">'"),
+        _hidden_attributes('"\'>"'),
+        # a ">" in the first value only: the other 1 499 sit after it
+        'a0=">" ' + " ".join(f'a{n}="1"' for n in range(1, 1_500)),
+        # whitespace around the "=" does not change where the value starts
+        " ".join(f'a{n} =\n  ">"' for n in range(1_500)),
+    ],
+    ids=["double", "single", "single-with-double", "double-with-single", "first-only", "spaced"],
+)
+@pytest.mark.parametrize(
+    "make_body",
+    [
+        lambda attributes: rss(f"<item {attributes}><guid>1</guid></item>"),
+        lambda attributes: (
+            f'<rss version="2.0"><channel {attributes}><title>T</title></channel></rss>'.encode()
+        ),
+        lambda attributes: (
+            f'<feed xmlns="http://www.w3.org/2005/Atom" {attributes}><title>F</title></feed>'
+        ).encode(),
+        # not well-formed XML: feedparser's strict parser fails and its loose parser takes over
+        lambda attributes: rss(f"<item {attributes}><guid>1</guid></item>") + b"<&",
+    ],
+    ids=["item", "channel", "atom-feed", "malformed"],
+)
+def test_a_tag_whose_values_hold_a_closing_bracket_still_counts_its_attributes(
+    attributes: str, make_body: Any
+) -> None:
+    with pytest.raises(ParseError) as caught:
+        parse_feed(make_body(attributes), BASE)
+    assert str(caught.value) == REFUSED
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        'if a &lt; b and c = "x then',
+        'if a < b and c = "x then',
+        '<a href="http://x/y>x</a>',
+        "<a title='it>x</a>",
+    ],
+    ids=["escaped", "less-than", "double-quote", "single-quote"],
+)
+def test_a_description_with_a_stray_quote_or_bracket_still_parses(description: str) -> None:
+    # Not well-formed XML, but feedparser's loose parser reads it, and so does the bot.
+    body = rss(
+        f"<item><title>I</title><guid>1</guid><description>{description}</description></item>",
+        "<item><title>J</title><guid>2</guid></item>",
+    )
+    assert [item.title for item in parse_feed(body, BASE).items] == ["I", "J"]
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_nesting_after_a_quote_that_never_closes_is_still_counted(quote: str) -> None:
+    # The quote swallows what follows for the XML parser, but the loose one reads past it.
+    body = rss(f"<item a={quote}x><guid>1</guid></item>" + "<a>" * 20_000)
+    with pytest.raises(ParseError) as caught:
+        parse_feed(body, BASE)
+    assert str(caught.value) == REFUSED
+
+
+@pytest.mark.parametrize("unclosed", ["before", "after"])
+@pytest.mark.parametrize("value", ['">"', "'>'"], ids=["double", "single"])
+def test_many_attributes_beside_a_quote_that_never_closes_are_refused_or_quick(
+    unclosed: str, value: str
+) -> None:
+    attributes = " ".join(f"a{n}={value}" for n in range(16_000))
+    stray = "<description>if a < b and c = 'x</description>"
+    parts = (
+        [stray, f"<item {attributes}>"] if unclosed == "before" else [f"<item {attributes}>", stray]
+    )
+    body = rss("".join(parts) + "<guid>1</guid></item>")
+
+    started = time.perf_counter()
+    try:
+        parse_feed(body, BASE)
+    except ParseError as error:
+        assert str(error) == REFUSED
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5, f"{len(body) // 1000} kB of attributes took {elapsed:.1f} s"
+
+
+def test_a_closing_bracket_in_an_attribute_value_parses() -> None:
+    body = atom_entry(
+        '<content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">'
+        '<p>See <a title="a &gt; b, c > d" href="https://e.example/x">this</a></p></div></content>'
+    )
+    (item,) = parse_feed(body, BASE).items
+    assert item.summary.startswith("See [this](https://e.example/x)")
+
+
+def test_an_enclosure_url_with_a_closing_bracket_parses() -> None:
+    body = rss(
+        '<item><title>E</title><guid>1</guid><enclosure type="audio/mpeg" length="1" '
+        'url="https://cdn.example.com/a.mp3?q=>1"/></item>'
+    )
+    (item,) = parse_feed(body, BASE).items
+    assert item.title == "E"

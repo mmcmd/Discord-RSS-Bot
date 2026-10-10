@@ -127,7 +127,7 @@ class Sources:
     async def fetch_image(self, url: str, *, max_bytes: int = 0):  # pragma: no cover
         raise AssertionError("not used")
 
-    def parse(self, body: bytes, url: str) -> ParsedFeed:
+    def parse(self, body: bytes, url: str, content_type: str = "") -> ParsedFeed:
         assert body == url.encode()
         self.parses.append(url)
         step = self.parse_script.get(url)
@@ -149,10 +149,12 @@ class FakeDeliverer:
         self.script: dict[str, Any] = {}
         self.attempts: list[str] = []
         self.posted: list[str] = []
+        self.covers: list[str | None] = []  # the cover image of each attempt
 
     async def deliver(self, feed: Feed, message: OutgoingMessage) -> DeliveryOutcome:
         text = message.content
         self.attempts.append(text)
+        self.covers.append(message.cover_image_url)
         step = self.script.get(text, D.DELIVERED)
         if isinstance(step, list):
             step = step.pop(0) if step else D.DELIVERED
@@ -168,8 +170,9 @@ class FakeDeliverer:
 
 
 class Renderer:
-    def __init__(self, prefix: str = "") -> None:
+    def __init__(self, prefix: str = "", cover: str | None = None) -> None:
         self.prefix = prefix
+        self.cover = cover  # the Cover image every message asks for
         self.broken: set[str] = set()  # the keys of Items it cannot render
         self.rendered: list[Item] = []
 
@@ -177,7 +180,7 @@ class Renderer:
         if item.key in self.broken:
             raise ValueError("cannot render this")
         self.rendered.append(item)
-        return OutgoingMessage(content=self.prefix + item.key)
+        return OutgoingMessage(content=self.prefix + item.key, cover_image_url=self.cover)
 
 
 class FakeNotifier:
@@ -981,6 +984,23 @@ async def test_the_time_limit_keeps_what_was_already_delivered(make):
     assert bench.deliverer.attempts.count("b") == 1
 
 
+async def test_an_item_whose_delivery_may_have_reached_discord_is_skipped_not_sent_again(make):
+    bench = make()
+    feed = await bench.started("news")
+    bench.publish(feed, item("b", 2), item("a", 1))
+    bench.deliverer.script["a"] = [D.UNKNOWN]
+
+    await bench.scheduler.tick()
+    assert bench.state(feed, "a") == (SKIPPED, 1)
+    assert bench.deliverer.attempts.count("a") == 1  # no second try with the default rendering
+    assert bench.deliverer.posted == ["b"]
+    assert bench.feed(feed).skipped_count == 1
+
+    bench.wait(feed)
+    await bench.scheduler.tick()
+    assert bench.deliverer.attempts.count("a") == 1
+
+
 async def test_an_item_left_as_being_sent_by_a_crash_is_skipped_not_sent_again(make):
     bench = make()
     feed = await bench.started("news")
@@ -1643,6 +1663,122 @@ async def test_a_feed_changed_while_it_is_fetched_posts_nothing(make, change):
         assert bench.state(feed, "new") is None
 
 
+async def test_a_feed_refreshed_meanwhile_is_not_checked_again_by_the_pass(make):
+    bench = make(max_concurrent=1)
+    first = bench.add("first", item("a"))
+    second = bench.add("second", item("b"))
+
+    def refresh_second(url: str) -> None:
+        if url == first.url:  # a Manager's Refresh of the other Feed has just finished
+            bench.db.update_feed(second.id, next_check_at=START + INTERVAL)
+
+    bench.sources.during_fetch = refresh_second
+
+    await bench.scheduler.tick()
+
+    assert [url for url, _, _ in bench.sources.fetches] == [first.url]
+
+
+async def moved_while_posting(bench: Bench, feed: Feed, outcome: D = D.DELIVERED) -> None:
+    """Set up: the Feed is moved to another channel while its Item "new" is being sent."""
+    bench.publish(feed, item("new"))
+    bench.wait(feed)
+
+    async def move() -> D:
+        bench.db.update_feed(feed.id, channel_id=777, paused=None, next_check_at=START)
+        return outcome
+
+    bench.deliverer.script["new"] = [move]
+
+
+async def test_a_feed_moved_during_a_check_keeps_the_schedule_it_was_given(make):
+    bench = make()
+    feed = await bench.started("news", item("old"))
+    await moved_while_posting(bench, feed)
+
+    await bench.scheduler.check_feed(feed.id)
+
+    stored = bench.feed(feed)
+    assert bench.status(feed, "new") is DELIVERED
+    assert stored.next_check_at == START  # not pushed out by the old channel's Check
+    assert stored.last_success_at != bench.clock.t
+    assert stored.etag is None
+
+
+async def test_a_feed_moved_while_posting_is_not_paused_by_the_old_channel(make):
+    bench = make()
+    feed = await bench.started("news", item("old"))
+    await moved_while_posting(bench, feed, D.LOST_CHANNEL)
+
+    await bench.scheduler.check_feed(feed.id)
+
+    stored = bench.feed(feed)
+    assert stored.paused is None
+    assert stored.next_check_at == START
+    assert bench.notifier.reports == []
+
+
+async def test_a_feed_pointed_elsewhere_while_fetched_does_not_fail_for_the_old_address(make):
+    bench = make()
+    feed = await bench.started("news", item("old"))
+    bench.sources.fetch_script[feed.url] = FetchError("gone")
+
+    def repoint(url: str) -> None:
+        bench.db.update_feed(feed.id, url="https://elsewhere.example/rss", next_check_at=START)
+
+    bench.sources.during_fetch = repoint
+    bench.wait(feed)
+
+    await bench.scheduler.check_feed(feed.id)
+
+    stored = bench.feed(feed)
+    assert (stored.fail_count, stored.last_error) == (0, "")
+    assert stored.next_check_at == START
+
+
+async def test_a_feed_paused_by_a_manager_is_not_paused_again_by_the_check(make):
+    bench = make()
+    feed = await bench.started("news", item("old"))
+    bench.publish(feed, item("new"))
+    bench.wait(feed)
+
+    async def paused_by_hand() -> D:
+        bench.db.update_feed(feed.id, paused=PauseReason.MANUAL)
+        return D.LOST_CHANNEL
+
+    bench.deliverer.script["new"] = [paused_by_hand]
+    await bench.scheduler.check_feed(feed.id)
+
+    assert bench.feed(feed).paused is PauseReason.MANUAL
+    assert bench.notifier.reports == []
+
+
+@pytest.mark.parametrize("change", ["deleted", "paused", "moved"])
+async def test_a_feed_changed_while_posting_stops_posting_quietly(make, caplog, change):
+    bench = make()
+    feed = await bench.started("news")
+    bench.publish(feed, item("c", 3), item("b", 2), item("a", 1))
+    bench.wait(feed)
+
+    async def change_feed() -> D:
+        if change == "deleted":
+            bench.db.delete_feed(feed.id)
+        elif change == "paused":
+            bench.db.update_feed(feed.id, paused=PauseReason.MANUAL)
+        else:
+            bench.db.update_feed(feed.id, channel_id=777)
+        return D.DELIVERED
+
+    bench.deliverer.script["a"] = [change_feed]
+    with caplog.at_level(logging.DEBUG):
+        await bench.scheduler.check_feed(feed.id)
+
+    assert bench.deliverer.attempts == ["a"]
+    assert [r for r in caplog.records if r.exc_info] == []
+    if change != "deleted":
+        assert bench.status(feed, "b") is None and bench.status(feed, "c") is None
+
+
 async def test_the_feeds_of_a_removed_server_are_not_checked(make):
     bench = make()
     feed = bench.add("news", item("a"))
@@ -2282,3 +2418,65 @@ async def test_pages_are_fetched_at_most_ten_at_a_time(make):
     bench.wait(feed)
     await bench.scheduler.check_feed(feed.id)
     assert 1 < bench.sources.peak <= 10
+
+
+@pytest.mark.parametrize("change", ["deleted", "paused", "moved"])
+async def test_a_feed_changed_while_covers_are_looked_up_posts_nothing(make, caplog, change):
+    bench = make()
+    feed = await bench.started("a", item("old"))
+    first, second = item("n1", 2), item("n2", 1)
+    bench.sources.pages[first.link] = bench.sources.pages[second.link] = article("")
+    bench.publish(feed, first, second)
+    bench.wait(feed)
+    due = bench.feed(feed).next_check_at
+
+    def act(url: str) -> None:
+        if url != first.link:  # a Manager acts while the pages are looked up
+            return
+        if change == "deleted":
+            bench.db.delete_feed(feed.id)
+        elif change == "paused":
+            bench.db.update_feed(feed.id, paused=PauseReason.MANUAL)
+        else:
+            bench.db.update_feed(feed.id, channel_id=777)
+
+    bench.sources.during_fetch = act
+    with caplog.at_level(logging.DEBUG):
+        await bench.scheduler.check_feed(feed.id)
+
+    assert bench.deliverer.attempts == []
+    assert [r for r in caplog.records if r.exc_info] == []
+    if change != "deleted":
+        # As when the Feed changes before a later Item: not recorded, nothing overwritten.
+        assert bench.status(feed, "n1") is None and bench.status(feed, "n2") is None
+        stored = bench.db.get_feed(feed.id)
+        assert (stored.fail_count, stored.last_error) == (0, "")
+        assert stored.next_check_at == due
+
+
+async def test_the_default_rendering_after_a_refusal_does_not_ask_for_the_cover_again(make):
+    bench = make()
+    bench.render.cover = bench.render_default.cover = "https://cdn.example/cover.png"
+    feed = await bench.started("a", item("old"))
+    bench.publish(feed, item("new"))
+    bench.deliverer.script["new"] = [D.REJECTED]
+    bench.wait(feed)
+
+    await bench.scheduler.check_feed(feed.id)
+
+    assert bench.deliverer.attempts == ["new", "plain:new"]
+    assert bench.deliverer.covers == ["https://cdn.example/cover.png", None]
+    assert bench.status(feed, "new") is DELIVERED
+
+
+async def test_the_default_rendering_keeps_the_cover_when_the_template_never_rendered(make):
+    bench = make()
+    bench.render_default.cover = "https://cdn.example/cover.png"
+    feed = await bench.started("a", item("old"))
+    bench.publish(feed, item("new"))
+    bench.render.broken.add("new")
+    bench.wait(feed)
+
+    await bench.scheduler.check_feed(feed.id)
+
+    assert bench.deliverer.covers == ["https://cdn.example/cover.png"]

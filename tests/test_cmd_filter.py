@@ -157,7 +157,7 @@ def test_every_action_and_form_name_starts_with_flt() -> None:
 async def test_the_command_shows_an_empty_feed(db: Database, service: FeedService) -> None:
     feed = add_feed(db)
     interaction = manager(db, service)
-    await flt.filter_command.callback(interaction, str(feed.id))  # type: ignore[arg-type]
+    await flt.filter_command.callback(interaction, ui.feed_value(feed.id))  # type: ignore[arg-type]
 
     name, sent = interaction.last
     assert name == "send_message"
@@ -613,7 +613,7 @@ async def test_the_command_is_refused_for_a_non_manager(db: Database, service: F
     feed = add_feed(db)
     interaction = person(db, service)
     with pytest.raises(ui.UserError, match="Only Managers and Admins"):
-        await flt.filter_command.callback(interaction, str(feed.id))  # type: ignore[arg-type]
+        await flt.filter_command.callback(interaction, ui.feed_value(feed.id))  # type: ignore[arg-type]
     assert interaction.calls == []
 
 
@@ -635,7 +635,7 @@ async def test_the_command_is_open_to_managers_and_admins(
     else:
         db.set_grant(SERVER, 55, TargetKind.ROLE, Level.MANAGER)
         interaction = person(db, service, role_ids=(55,))
-    await flt.filter_command.callback(interaction, str(feed.id))  # type: ignore[arg-type]
+    await flt.filter_command.callback(interaction, ui.feed_value(feed.id))  # type: ignore[arg-type]
     assert interaction.last[0] == "send_message"
 
 
@@ -687,7 +687,7 @@ async def test_the_command_refuses_a_feed_of_another_server(
     foreign = add_feed(db, "Foreign", OTHER_SERVER)
     interaction = manager(db, service)
     with pytest.raises(ui.UserError, match="no longer exists"):
-        await flt.filter_command.callback(interaction, str(foreign.id))  # type: ignore[arg-type]
+        await flt.filter_command.callback(interaction, ui.feed_value(foreign.id))  # type: ignore[arg-type]
     with pytest.raises(ui.UserError, match="no longer exists"):
         await flt.open_filters(interaction, foreign.id)  # type: ignore[arg-type]
     assert interaction.calls == []

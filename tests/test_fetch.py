@@ -15,6 +15,7 @@ from yarl import URL
 
 from rssbot import fetch as fetch_module
 from rssbot.fetch import (
+    BAD_REDIRECT_MESSAGE,
     BAD_URL_MESSAGE,
     MAX_FEED_BYTES,
     REFUSED_MESSAGE,
@@ -126,6 +127,12 @@ async def gzipped(request: web.Request) -> web.Response:
     return web.Response(body=gzip.compress(FEED_BODY), headers={"Content-Encoding": "gzip"})
 
 
+async def long_header(request: web.Request) -> web.Response:
+    # Sites do send a Content-Security-Policy this long.
+    headers = {"Content-Security-Policy": "default-src " + "a" * 20_000}
+    return web.Response(body=FEED_BODY, headers=headers, content_type="application/rss+xml")
+
+
 async def slow(request: web.Request) -> web.Response:
     await asyncio.sleep(30)
     return web.Response(body=FEED_BODY)
@@ -204,6 +211,7 @@ async def site() -> AsyncIterator[Site]:
             web.get("/endless", endless),
             web.get("/bomb", bomb),
             web.get("/gzipped", gzipped),
+            web.get("/long-header", long_header),
             web.get("/slow", slow),
             web.get("/drop", drop),
             web.get("/status/{code}", status),
@@ -290,6 +298,13 @@ async def test_not_modified_keeps_previous_validators_when_the_site_sends_none(
 async def test_unasked_304_is_an_error(site: Site, open_fetcher: HttpFetcher) -> None:
     with pytest.raises(FetchError, match="304"):
         await open_fetcher.fetch(site.url("/bare304"))
+
+
+async def test_a_response_with_a_very_long_header_is_read(
+    site: Site, open_fetcher: HttpFetcher
+) -> None:
+    result = await open_fetcher.fetch(site.url("/long-header"))
+    assert result.body == FEED_BODY
 
 
 async def test_validator_with_a_line_break_is_not_sent(
@@ -1156,3 +1171,31 @@ async def test_fetch_image_non_200(site: Site, open_fetcher: HttpFetcher) -> Non
 async def test_fetch_image_follows_redirects(site: Site, open_fetcher: HttpFetcher) -> None:
     image = await open_fetcher.fetch_image(site.url("/to") + "?url=/img/webp")
     assert image.content_type == "image/webp"
+
+
+# --- review fixes ---
+
+
+async def test_fetch_reports_the_content_type(site: Site, open_fetcher: HttpFetcher) -> None:
+    result = await open_fetcher.fetch(site.url("/feed"))
+    assert result.content_type == "application/rss+xml"
+
+
+@pytest.mark.parametrize(
+    "target", ["file:///etc/passwd", "ftp://example.com/x", "http://user:pw@example.com/"]
+)
+async def test_redirect_to_a_bad_url_gets_the_redirect_message(
+    site: Site, open_fetcher: HttpFetcher, target: str
+) -> None:
+    with pytest.raises(FetchError) as caught:
+        await open_fetcher.fetch(site.url("/to") + "?url=" + target)
+    assert str(caught.value) == BAD_REDIRECT_MESSAGE
+    assert caught.value.permanent
+
+
+@pytest.mark.parametrize("declared", ["image/jpg", "image/pjpeg", "IMAGE/JPG"])
+async def test_fetch_image_accepts_jpeg_aliases(
+    site: Site, open_fetcher: HttpFetcher, declared: str
+) -> None:
+    image = await open_fetcher.fetch_image(site.url("/img/jpeg") + "?type=" + declared)
+    assert (image.content_type, image.filename) == ("image/jpeg", "image.jpg")

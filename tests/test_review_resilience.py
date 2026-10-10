@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sqlite3
 from types import SimpleNamespace
 from typing import Any
 
@@ -33,8 +34,10 @@ import pytest
 
 from rssbot.db import Database
 from rssbot.deliver import DiscordDeliverer
-from rssbot.models import ChannelKind, Feed, OutgoingMessage
-from rssbot.ports import DeliveryOutcome, ImageData
+from rssbot.journal import Journal
+from rssbot.models import Actor, ChannelKind, Feed, Item, OutgoingMessage, ParsedFeed
+from rssbot.ports import DeliveryOutcome, FetchResult, ImageData
+from rssbot.service import FeedService
 
 CHAN_A, CHAN_B = 100, 101
 FORUM_A, FORUM_B = 200, 201
@@ -219,3 +222,56 @@ async def test_cover_lock_stuck_send_blocks_an_unrelated_feed() -> None:
     finally:
         await _cancel(*(t for t in (task_a, task_b) if t is not None))
         db.close()
+
+
+async def test_a_failed_baseline_on_a_new_address_leaves_the_old_address() -> None:
+    # DEFECT: edit_feed stored the new address and only then recorded the Seen items of its
+    # source; if that second write failed, the Feed kept the new address with no starting
+    # point and its next Check posted every old Item.
+    db = Database(":memory:")
+    old, new = "https://a.example/feed", "https://b.example/feed"
+    listings = {
+        old: ParsedFeed(
+            "A", "https://a.example/", "", (Item("a1", "A1", "", "", "", "", None, (), ""),)
+        ),
+        new: ParsedFeed(
+            "B",
+            "https://b.example/",
+            "",
+            tuple(Item(key, key, "", "", "", "", None, (), "") for key in ("b1", "b2")),
+        ),
+    }
+
+    class Clock:
+        def now(self) -> int:
+            return 1_700_000_000
+
+    class Web:
+        async def fetch(self, url: str, **kwargs: Any) -> FetchResult:
+            return FetchResult(False, url.encode(), None, None, url)
+
+    service = FeedService(
+        db,
+        Web(),  # type: ignore[arg-type]
+        Clock(),
+        Journal(db, Clock()),
+        parse=lambda body, url, content_type="": listings[body.decode()],
+    )
+    actor = Actor(id=7, name="Alex")
+    feed, _ = await service.add_feed(1, CHAN_A, ChannelKind.MESSAGES, old, actor=actor)
+
+    def disk_full(*args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    real = db.record_seen
+    db.record_seen = disk_full  # type: ignore[method-assign]
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            await service.edit_feed(1, feed.id, url=new, actor=actor)
+    finally:
+        db.record_seen = real  # type: ignore[method-assign]
+
+    stored = db.get_feed(feed.id)
+    assert stored is not None
+    assert stored.url == old
+    db.close()

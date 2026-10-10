@@ -22,7 +22,10 @@ from rssbot.models import (
     Change,
     ChannelKind,
     Feed,
+    FilterField,
+    FilterList,
     Item,
+    ItemStatus,
     Level,
     LogEntry,
     LogKind,
@@ -47,6 +50,7 @@ FORUM = 72
 VOICE = 73
 THREAD = 74
 LOCKED = 75
+DELETED = 76  # a channel the Server no longer has
 URL = "https://example.com/feed.xml"
 URL2 = "https://other.example/rss"
 URL3 = "https://example.com/third"
@@ -97,18 +101,23 @@ class Clock:
         self.t += int(seconds)
 
 
-def item(key: str) -> Item:
+def item(key: str, author: str = "") -> Item:
     return Item(
         key=key,
         title=f"Title {key}",
         link=f"https://example.com/{key}",
         summary=f"Summary {key}",
         content="",
-        author="",
+        author=author,
         published=None,
         categories=(),
         image="",
     )
+
+
+def ref(key: str) -> int:
+    """What stands for that Item in a custom id."""
+    return feed._item_ref(item(key))
 
 
 class Web:
@@ -130,7 +139,7 @@ class Web:
     async def fetch_image(self, url: str, *, max_bytes: int = 0) -> ImageData:
         raise FetchError("no images here")
 
-    def parse(self, body: bytes, url: str) -> ParsedFeed:
+    def parse(self, body: bytes, url: str, content_type: str = "") -> ParsedFeed:
         return self.listings[body.decode()]
 
 
@@ -377,7 +386,7 @@ async def test_commands_are_refused_for_a_non_manager(env: Env) -> None:
     with pytest.raises(ui.UserError, match="Only Managers"):
         await feed.list_command.callback(interaction)  # type: ignore[arg-type]
     with pytest.raises(ui.UserError, match="Only Managers"):
-        await feed.pause_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+        await feed.pause_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
     with pytest.raises(ui.UserError, match="Only Managers"):
         await feed.export_command.callback(interaction)  # type: ignore[arg-type]
     assert interaction.calls == []
@@ -400,9 +409,16 @@ async def test_a_form_is_refused_for_a_non_manager(env: Env) -> None:
 
 async def test_another_servers_feed_is_refused_on_a_button(env: Env) -> None:
     foreign = await env.add(server_id=OTHER_SERVER)
-    for button in (feed.PauseFeed, feed.RemoveFeed, feed.BackToPanel, feed.PostPreview):
+    buttons = (
+        feed.PauseFeed(foreign.id),
+        feed.RemoveFeed(foreign.id),
+        feed.BackToPanel(foreign.id),
+        feed.PostPreview(foreign.id, ref("a")),
+        feed.PickPreview(foreign.id, ref("a")),
+    )
+    for button in buttons:
         interaction = env.click()
-        await button(foreign.id).callback(interaction)  # type: ignore[arg-type]
+        await button.callback(interaction)  # type: ignore[arg-type]
         assert interaction.text == ui.FEED_GONE
     assert env.feed(foreign.id).paused is None
     assert env.posts.sent == []
@@ -667,7 +683,7 @@ async def test_list_does_not_open_another_servers_feed(env: Env) -> None:
 async def test_edit_opens_the_panel_not_a_form(env: Env) -> None:
     found = await env.add()
     interaction = env.interaction()
-    await feed.edit_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.edit_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
 
     assert interaction.last[0] == "send_message"
     assert interaction.text.startswith(f"**Feed**: {found.name}")
@@ -688,6 +704,54 @@ async def test_settings_opens_a_prefilled_form_keeping_an_unlisted_interval(env:
     options = fields["interval"]["options"]
     assert len(options) == 10
     assert [(o["value"], o["label"]) for o in options if o["default"]] == [("5400", "90 minutes")]
+
+
+async def test_settings_leaves_the_channel_optional_when_it_cannot_be_shown(env: Env) -> None:
+    # Not in the cache is not deleted: an archived thread is dropped from it too. Discord may
+    # refuse an unknown default, so none is sent and the channel need not be picked to save.
+    gone = await env.add(url=URL2, channel_id=DELETED)
+    interaction = env.click(channels=channels())
+    await feed.SettingsButton(gone.id).callback(interaction)  # type: ignore[arg-type]
+    field = form_fields(interaction)["channel"]
+    assert not field.get("default_values")
+    assert field["required"] is False
+
+    kept = await env.add(channel_id=TEXT)
+    interaction = env.click(channels=channels())
+    await feed.SettingsButton(kept.id).callback(interaction)  # type: ignore[arg-type]
+    field = form_fields(interaction)["channel"]
+    assert field["default_values"] == [{"id": TEXT, "type": "channel"}]
+    assert field["required"] is True
+
+
+async def test_settings_without_a_channel_pick_keeps_the_channel(env: Env) -> None:
+    gone = await env.add(url=URL2, channel_id=DELETED)
+    data = edit_form(gone, TEXT, name="Renamed")
+    # Discord sends an optional select left alone as an empty list.
+    (picked,) = [c for c in data["components"] if c["component"]["custom_id"] == "channel"]
+    picked["component"]["values"] = []
+    data["resolved"] = {}
+    interaction = await submit(env, data, channels=channels())
+
+    changed = env.feed(gone.id)
+    assert (changed.name, changed.channel_id) == ("Renamed", DELETED)
+    assert "**Feed**: Renamed" in interaction.text
+    assert env.posts.cleaned == []
+
+    data = edit_form(gone, TEXT, name="Again")
+    data["components"] = [c for c in data["components"] if c["component"]["custom_id"] != "channel"]
+    await submit(env, data, channels=channels())  # the component missing altogether
+    changed = env.feed(gone.id)
+    assert (changed.name, changed.channel_id) == ("Again", DELETED)
+
+
+async def test_settings_with_a_channel_pick_moves_a_feed_whose_channel_was_not_shown(
+    env: Env,
+) -> None:
+    gone = await env.add(url=URL2, channel_id=DELETED)
+    await submit(env, edit_form(gone, TEXT, name="Moved"), channels=channels())
+    changed = env.feed(gone.id)
+    assert (changed.name, changed.channel_id) == ("Moved", TEXT)
 
 
 async def test_edit_rejects_an_option_that_is_not_a_feed(env: Env) -> None:
@@ -776,7 +840,7 @@ async def test_edit_shows_the_services_sentence(env: Env) -> None:
 async def test_remove_asks_first(env: Env) -> None:
     found = await env.add()
     interaction = env.interaction()
-    await feed.remove_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.remove_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
 
     assert f"Remove the Feed **Example News** from <#{TEXT}>?" in interaction.text
     view = interaction.last[1]["view"]
@@ -834,14 +898,22 @@ async def test_remove_from_the_panel_asks_in_place_and_cancel_returns(env: Env) 
 async def test_pause_and_resume_act_at_once(env: Env) -> None:
     found = await env.add()
     paused = env.interaction()
-    await feed.pause_command.callback(paused, str(found.id))  # type: ignore[arg-type]
+    await feed.pause_command.callback(paused, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert env.feed(found.id).paused is PauseReason.MANUAL
     assert paused.text.startswith("Paused the Feed **Example News**.")
 
     resumed = env.interaction()
-    await feed.resume_command.callback(resumed, str(found.id))  # type: ignore[arg-type]
+    await feed.resume_command.callback(resumed, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert env.feed(found.id).paused is None
     assert resumed.text.startswith("Resumed the Feed **Example News**.")
+
+
+async def test_resume_of_a_feed_that_is_not_paused_says_so(env: Env) -> None:
+    found = await env.add()
+    interaction = env.interaction()
+    with pytest.raises(ui.UserError, match="That Feed is not paused."):
+        await feed.resume_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+    assert env.feed(found.id).paused is None
 
 
 async def test_pause_and_resume_buttons_edit_the_panel(env: Env) -> None:
@@ -870,7 +942,7 @@ async def test_refresh_posts_new_items_without_waiting_for_the_feeds_turn(env: E
     env.web.listings[URL] = ParsedFeed("Example News", "", "", tuple(item(k) for k in "abcd"))
 
     interaction = env.interaction()
-    await feed.refresh_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.refresh_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert [feed_id for feed_id, _ in env.posts.sent] == [found.id]
     assert interaction.calls[0][0] == "defer"
     assert interaction.text == (
@@ -891,7 +963,7 @@ async def test_refresh_says_when_the_check_failed(env: Env) -> None:
     found = await env.add()
     del env.web.listings[URL]
     interaction = env.interaction()
-    await feed.refresh_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.refresh_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert interaction.text == (
         "Refreshed the Feed **Example News**. Failing: The address answered with error 404."
     )
@@ -903,7 +975,7 @@ async def test_refresh_says_when_the_site_rate_limits(env: Env) -> None:
     env.web.errors[URL] = FetchError("slow down", slow_down=True)
     interaction = env.interaction()
     # One Rate-limited feed may be refreshed: it is one request, asked for on purpose.
-    await feed.refresh_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.refresh_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert interaction.text == "Refreshed the Feed **Example News**. Rate limited"
 
 
@@ -911,7 +983,7 @@ async def test_refresh_refuses_a_paused_feed(env: Env) -> None:
     found = await env.add()
     await env.service.pause_feed(SERVER, found.id, actor=MEMBER)
     with pytest.raises(ui.UserError, match="That Feed is paused"):
-        await feed.refresh_command.callback(env.interaction(), str(found.id))  # type: ignore[arg-type]
+        await feed.refresh_command.callback(env.interaction(), ui.feed_value(found.id))  # type: ignore[arg-type]
     with pytest.raises(ui.UserError, match="That Feed is paused"):
         await feed.RefreshButton(found.id).handle(env.click())  # type: ignore[arg-type]
     assert "Refresh" not in rows((await feed._panel(env.interaction(), env.feed(found.id)))[1])[2]  # type: ignore[arg-type]
@@ -956,7 +1028,7 @@ async def test_resume_warns_when_the_channel_is_still_out_of_reach(env: Env) -> 
     found = await env.add(channel_id=LOCKED)
     env.db.update_feed(found.id, paused=PauseReason.LOST_CHANNEL)
     command = env.interaction(channels=locked_channels())
-    await feed.resume_command.callback(command, str(found.id))  # type: ignore[arg-type]
+    await feed.resume_command.callback(command, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert env.feed(found.id).paused is None
     assert command.text.splitlines() == [
         "Resumed the Feed **Example News**. It is checked again from now on.",
@@ -973,7 +1045,7 @@ async def test_resume_warns_when_the_channel_is_still_out_of_reach(env: Env) -> 
     # Once the bot has access again there is nothing to warn about.
     env.db.update_feed(found.id, paused=PauseReason.LOST_CHANNEL)
     fine = env.interaction(channels=(*channels(), FakeChannel(LOCKED, "unlocked")))
-    await feed.resume_command.callback(fine, str(found.id))  # type: ignore[arg-type]
+    await feed.resume_command.callback(fine, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert fine.text == "Resumed the Feed **Example News**. It is checked again from now on."
 
 
@@ -981,7 +1053,7 @@ async def test_resume_warns_when_the_forum_still_needs_a_tag(env: Env) -> None:
     found = await env.add(channel_id=FORUM, kind=ChannelKind.FORUM)
     env.db.update_feed(found.id, paused=PauseReason.NEEDS_TAG)
     command = env.interaction()
-    await feed.resume_command.callback(command, str(found.id))  # type: ignore[arg-type]
+    await feed.resume_command.callback(command, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert env.feed(found.id).paused is None
     assert command.text.splitlines() == [
         "Resumed the Feed **Example News**. It is checked again from now on.",
@@ -1005,7 +1077,7 @@ async def test_resume_warns_when_the_forum_still_needs_a_tag(env: Env) -> None:
         assert click.text.startswith("**Feed**: Example News")
         env.db.update_feed(found.id, **changes)
         command = env.interaction()
-        await feed.resume_command.callback(command, str(found.id))  # type: ignore[arg-type]
+        await feed.resume_command.callback(command, ui.feed_value(found.id))  # type: ignore[arg-type]
         assert command.text == (
             "Resumed the Feed **Example News**. It is checked again from now on."
         )
@@ -1022,7 +1094,7 @@ async def test_test_previews_privately_without_posting(env: Env) -> None:
     await env.service.add_button(SERVER, found.id, "Read", "{{link}}", actor=MEMBER)
     await env.service.set_mentions(SERVER, found.id, [ROLE], actor=MEMBER)
     interaction = env.interaction()
-    await feed.test_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
 
     assert names(interaction) == ["defer", "followup", "followup"]
     preview, note = interaction.calls[1][1], interaction.calls[2][1]
@@ -1034,13 +1106,22 @@ async def test_test_previews_privately_without_posting(env: Env) -> None:
     assert f"as it would be posted in <#{TEXT}>" in note["content"]
     assert "Nothing has been posted" in note["content"]
     assert "Forum post title" not in note["content"]
-    assert note["content"].splitlines()[-1] == f"Posting it will mention <@&{ROLE}>."
+    assert note["content"].splitlines() == [
+        f"Above is the newest Item of **Example News** as it would be posted in <#{TEXT}>. "
+        "Nothing has been posted.",
+        "**1. Title a**",
+        "2. Title b",
+        "3. Title c",
+        f"Posting it will mention <@&{ROLE}>.",
+    ]
     assert note["allowed_mentions"] is ui.NO_MENTIONS  # saying so pings nobody
     assert component_ids(note["view"]) == [
-        f"rss:c:feed_post:{found.id}",
+        *(f"rss:c:feed_test_pick:{found.id}:{ref(key)}" for key in "abc"),
+        f"rss:c:feed_post:{found.id}:{ref('a')}",
         f"rss:c:feed_panel:{found.id}",
     ]
-    assert rows(note["view"]) == [["Post to channel", "Back to Feed"]]
+    assert rows(note["view"]) == [["1", "2", "3"], ["Post to channel", "Back to Feed"]]
+    assert [button.item.disabled for button in note["view"].children[:3]] == [True, False, False]
     assert env.posts.sent == []
 
     # Back turns the note into the Feed panel; the preview above is another message.
@@ -1062,7 +1143,186 @@ async def test_test_of_a_forum_feed_says_the_forum_post_title(env: Env) -> None:
     assert "**Forum post title**: Example News: Title a" in interaction.text
     assert "**Post as**: Example News" in interaction.text
     assert "will mention" not in interaction.text  # the Feed has no mention roles
+    assert rows(interaction.last[1]["view"])[-1] == ["Post to channel", "Back to Feed"]
+
+
+async def test_test_says_so_when_discord_refuses_the_preview(env: Env) -> None:
+    found = await env.add()
+    interaction = env.interaction()
+    sends: list[dict[str, Any]] = []
+
+    async def followup(**kwargs: Any) -> None:
+        sends.append(kwargs)
+        if len(sends) == 1:
+            raise discord.HTTPException(SimpleNamespace(status=400, reason="Bad Request"), "no")  # type: ignore[arg-type]
+
+    interaction.followup = SimpleNamespace(send=followup)
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert len(sends) == 2
+    assert "Discord refused it" in sends[1]["content"]
+    assert env.posts.sent == []
+
+
+async def test_test_of_a_feed_with_one_item_has_no_numbers(env: Env) -> None:
+    found = await env.add(URL2)
+    interaction = env.interaction()
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert "Above is the newest Item of **Other Site**" in interaction.text
+    assert "1." not in interaction.text
     assert rows(interaction.last[1]["view"]) == [["Post to channel", "Back to Feed"]]
+
+
+async def test_a_number_shows_that_item_in_new_messages(env: Env) -> None:
+    found = await env.add()
+    interaction = env.click()
+    await feed.PickPreview(found.id, ref("b")).callback(interaction)  # type: ignore[arg-type]
+
+    assert names(interaction) == ["defer", "followup", "followup"]
+    assert interaction.calls[0][1] == {"ephemeral": True, "thinking": True}  # the old note stays
+    preview, note = interaction.calls[1][1], interaction.calls[2][1]
+    assert "**Title b**" in preview["content"]
+    assert note["content"].splitlines() == [
+        f"Above is Item 2 of **Example News** as it would be posted in <#{TEXT}>. "
+        "Nothing has been posted.",
+        "1. Title a",
+        "**2. Title b**",
+        "3. Title c",
+    ]
+    assert [button.item.disabled for button in note["view"].children[:3]] == [False, True, False]
+    assert component_ids(note["view"])[3] == f"rss:c:feed_post:{found.id}:{ref('b')}"
+    assert env.posts.sent == []
+
+
+async def test_a_number_for_an_item_that_is_gone_shows_the_newest_and_says_so(env: Env) -> None:
+    found = await env.add()
+    interaction = env.click()
+    await feed.PickPreview(found.id, ref("gone")).callback(interaction)  # type: ignore[arg-type]
+
+    preview, note = interaction.calls[1][1], interaction.calls[2][1]
+    assert "**Title a**" in preview["content"]
+    assert note["content"].splitlines()[:2] == [
+        "The Item you chose is no longer one the Feed would post.",
+        f"Above is the newest Item of **Example News** as it would be posted in <#{TEXT}>. "
+        "Nothing has been posted.",
+    ]
+
+
+async def test_test_skips_the_items_the_filters_hold_back_and_names_them(env: Env) -> None:
+    found = await env.add()
+    env.web.listings[URL] = ParsedFeed(
+        "Example News",
+        "",
+        "",
+        (item("a", "Sponsored by Acme"), item("b"), item("c", "Sponsored by Zed"), item("d")),
+    )
+    await env.service.add_filters(
+        SERVER, found.id, FilterList.BLOCK, FilterField.AUTHOR, ["Sponsored"], actor=MEMBER
+    )
+    interaction = env.interaction()
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert names(interaction) == ["defer", "followup", "followup"]
+    preview, note = interaction.calls[1][1], interaction.calls[2][1]
+    assert "**Title b**" in preview["content"]
+    assert note["content"].splitlines() == [
+        "Above is the newest Item your Filters let through of **Example News** as it would be "
+        f"posted in <#{TEXT}>. Nothing has been posted.",
+        "**1. Title b**",
+        "2. Title d",
+        "Held back by your Filters: *Title a*, *Title c*.",
+    ]
+    assert component_ids(note["view"]) == [
+        f"rss:c:feed_test_pick:{found.id}:{ref('b')}",
+        f"rss:c:feed_test_pick:{found.id}:{ref('d')}",
+        f"rss:c:feed_post:{found.id}:{ref('b')}",
+        f"rss:c:feed_panel:{found.id}",
+    ]
+
+    # A held-back Item cannot be shown by its number either.
+    picked = env.click()
+    await feed.PickPreview(found.id, ref("a")).callback(picked)  # type: ignore[arg-type]
+    assert "**Title b**" in picked.calls[1][1]["content"]
+    assert "no longer one the Feed would post" in picked.text
+
+
+async def test_test_names_five_held_back_items_and_counts_the_rest(env: Env) -> None:
+    found = await env.add()
+    env.web.listings[URL] = ParsedFeed(
+        "Example News", "", "", (*(item(key, "Sponsored") for key in "abcdefg"), item("z"))
+    )
+    await env.service.add_filters(
+        SERVER, found.id, FilterList.BLOCK, FilterField.AUTHOR, ["Sponsored"], actor=MEMBER
+    )
+    interaction = env.interaction()
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert interaction.text.splitlines()[1] == (
+        "Held back by your Filters: *Title a*, *Title b*, *Title c*, *Title d*, *Title e* "
+        "and 2 more."
+    )
+    assert rows(interaction.last[1]["view"]) == [["Post to channel", "Back to Feed"]]
+
+
+async def test_test_when_the_filters_hold_back_every_item(env: Env) -> None:
+    found = await env.add()
+    await env.service.add_filters(
+        SERVER, found.id, FilterList.MUST_HAVE, FilterField.TITLE, ["linux"], actor=MEMBER
+    )
+    interaction = env.interaction()
+    await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
+
+    assert names(interaction) == ["defer", "followup"]  # no preview
+    assert interaction.text.splitlines() == [
+        "Your Filters hold back all 3 Items that **Example News** lists right now, "
+        "so there is nothing to test.",
+        "Held back by your Filters: *Title a*, *Title b*, *Title c*.",
+    ]
+    assert rows(interaction.last[1]["view"]) == [["Back to Feed"]]
+
+
+async def test_post_to_channel_posts_the_chosen_item(env: Env) -> None:
+    found = await env.add()
+    interaction = env.click()
+    await feed.PostPreview(found.id, ref("c")).callback(interaction)  # type: ignore[arg-type]
+
+    ((_, message),) = env.posts.sent
+    assert "**Title c**" in message.content
+    assert interaction.text == f"Posted the Item in <#{TEXT}>."
+    states = env.db.seen_states(found.id, ["a", "c"])
+    assert states["c"][0] is ItemStatus.DELIVERED
+
+
+@pytest.mark.parametrize("key", ["a", "gone"])
+async def test_post_to_channel_never_posts_an_item_the_filters_hold_back(
+    env: Env, key: str
+) -> None:
+    found = await env.add()
+    await env.service.add_filters(
+        SERVER, found.id, FilterList.BLOCK, FilterField.TITLE, ["Title a"], actor=MEMBER
+    )
+    interaction = env.click()
+    await feed.PostPreview(found.id, ref(key)).callback(interaction)  # type: ignore[arg-type]
+
+    assert env.posts.sent == []
+    assert names(interaction) == ["defer", "edit_original_response"]
+    assert interaction.text == feed.POST_GONE
+    assert rows(interaction.last[1]["view"]) == [["Test again", "Back to Feed"]]
+    assert env.db.seen_states(found.id, ["a"])["a"][0] is ItemStatus.SEEN
+
+
+async def test_post_to_channel_records_the_item_so_a_check_does_not_post_it_again(
+    env: Env,
+) -> None:
+    found = await env.add()
+    env.posts.outcome = DeliveryOutcome.RETRY
+    await feed.PostPreview(found.id, ref("a")).callback(env.click())  # type: ignore[arg-type]
+    assert env.db.seen_states(found.id, ["a"])["a"][0] is ItemStatus.SEEN  # nothing was posted
+
+    env.posts.outcome = DeliveryOutcome.DELIVERED
+    await feed.PostPreview(found.id, ref("a")).callback(env.click())  # type: ignore[arg-type]
+    assert env.db.seen_states(found.id, ["a"])["a"][0] is ItemStatus.DELIVERED
 
 
 async def test_test_shows_the_services_sentence(env: Env) -> None:
@@ -1070,15 +1330,16 @@ async def test_test_shows_the_services_sentence(env: Env) -> None:
     del env.web.listings[URL]
     interaction = env.interaction()
     with pytest.raises(ServiceError, match="error 404"):
-        await feed.test_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+        await feed.test_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert names(interaction) == ["defer"]
 
 
 @pytest.mark.parametrize(
     ("outcome", "words", "again"),
     [
-        (DeliveryOutcome.DELIVERED, f"Posted the newest Item in <#{TEXT}>.", False),
+        (DeliveryOutcome.DELIVERED, f"Posted the Item in <#{TEXT}>.", False),
         (DeliveryOutcome.RETRY, "try again in a minute", True),
+        (DeliveryOutcome.UNKNOWN, "cannot tell whether the message was posted", True),
         (DeliveryOutcome.REJECTED, "Discord refused the message", True),
         (DeliveryOutcome.LOST_CHANNEL, f"The bot cannot post in <#{TEXT}>", True),
         (DeliveryOutcome.NEEDS_TAG, "requires a tag on every Forum post", True),
@@ -1090,7 +1351,7 @@ async def test_post_to_channel_reports_each_outcome(
     found = await env.add()
     env.posts.outcome = outcome
     interaction = env.click()
-    await feed.PostPreview(found.id).callback(interaction)  # type: ignore[arg-type]
+    await feed.PostPreview(found.id, ref("a")).callback(interaction)  # type: ignore[arg-type]
 
     ((feed_id, message),) = env.posts.sent
     assert feed_id == found.id and "**Title a**" in message.content
@@ -1100,7 +1361,7 @@ async def test_post_to_channel_reports_each_outcome(
     back = f"rss:c:feed_panel:{found.id}"
     if again:
         assert rows(view) == [["Try again", "Back to Feed"]]
-        assert component_ids(view) == [f"rss:c:feed_post:{found.id}", back]
+        assert component_ids(view) == [f"rss:c:feed_post:{found.id}:{ref('a')}", back]
     else:
         assert rows(view) == [["Back to Feed"]]
         assert component_ids(view) == [back]
@@ -1112,7 +1373,7 @@ async def test_post_to_channel_reports_each_outcome(
     assert names(returned) == ["edit_message"]
     assert returned.text.startswith("**Feed**: Example News")
     wordings = {text for text in feed.OUTCOME_WORDS.values()}
-    assert set(feed.OUTCOME_WORDS) == set(DeliveryOutcome) and len(wordings) == 5
+    assert set(feed.OUTCOME_WORDS) == set(DeliveryOutcome) and len(wordings) == 6
 
 
 # -- /feed import and export --
@@ -1288,6 +1549,38 @@ async def test_panel_warns_when_the_bot_cannot_post_in_the_channel(env: Env) -> 
     unknown = env.interaction()
     await feed.open_panel(unknown, found.id)  # type: ignore[arg-type]
     assert "**Warning**" not in unknown.text
+
+
+async def test_panel_names_the_permission_the_bot_lacks(env: Env) -> None:
+    plain = FakeChannel(TEXT, "news", lacking=("embed_links",))
+    thread = FakeChannel(
+        THREAD, "a-thread", discord.ChannelType.public_thread, lacking=("send_messages_in_threads",)
+    )
+    in_thread = await env.add(channel_id=THREAD)
+    shown = env.interaction(channels=(plain, thread))
+    await feed.open_panel(shown, in_thread.id)  # type: ignore[arg-type]
+    assert shown.text.splitlines()[-1] == warning(THREAD)
+
+    found = await env.add(url=URL2, channel_id=TEXT)
+    quiet = env.interaction(channels=(plain, thread))
+    await feed.open_panel(quiet, found.id)  # type: ignore[arg-type]
+    assert "**Warning**" not in quiet.text  # no Embed is posted
+
+    await env.service.set_embed(SERVER, found.id, title="{{title}}", actor=MEMBER)
+    loud = env.interaction(channels=(plain, thread))
+    await feed.open_panel(loud, found.id)  # type: ignore[arg-type]
+    assert "lacks the Embed Links permission" in loud.text.splitlines()[-1]
+
+
+async def test_panel_of_a_feed_in_a_thread_of_a_channel_without_send_messages(env: Env) -> None:
+    # The parent denies Send Messages but allows Send Messages in Threads: the bot can post.
+    thread = FakeChannel(
+        THREAD, "a-thread", discord.ChannelType.public_thread, lacking=("send_messages",)
+    )
+    in_thread = await env.add(channel_id=THREAD)
+    interaction = env.interaction(channels=(thread,))
+    await feed.open_panel(interaction, in_thread.id)  # type: ignore[arg-type]
+    assert "**Warning**" not in interaction.text
 
 
 async def test_panel_of_a_feed_in_a_forum(env: Env) -> None:
@@ -1668,12 +1961,11 @@ async def test_adding_and_editing_are_saved_by_the_member_who_did_it(env: Env) -
 
 async def test_pause_resume_and_remove_are_saved_by_the_member_who_did_it(env: Env) -> None:
     found = await env.add()
-    await feed.pause_command.callback(env.interaction(**ROBIN), str(found.id))  # type: ignore[arg-type]
+    await feed.pause_command.callback(env.interaction(**ROBIN), ui.feed_value(found.id))  # type: ignore[arg-type]
     await feed.PauseFeed(found.id).callback(env.click(**ROBIN))  # type: ignore[arg-type]
     await feed.ResumeFeed(found.id).callback(env.click(**ROBIN))  # type: ignore[arg-type]
-    await feed.resume_command.callback(env.interaction(**ROBIN), str(found.id))  # type: ignore[arg-type]
     await feed.PauseFeed(found.id).callback(env.click(**ROBIN))  # type: ignore[arg-type]
-    await feed.resume_command.callback(env.interaction(**ROBIN), str(found.id))  # type: ignore[arg-type]
+    await feed.resume_command.callback(env.interaction(**ROBIN), ui.feed_value(found.id))  # type: ignore[arg-type]
     await feed.RemoveFeed(found.id).callback(env.click(**ROBIN))  # type: ignore[arg-type]
     assert kinds_by_robin(env, 1) == [
         LogKind.FEED_PAUSED,
@@ -1718,11 +2010,11 @@ async def test_an_import_is_saved_by_the_member_who_did_it(env: Env) -> None:
 
 async def test_refresh_previews_exports_and_refusals_are_not_saved(env: Env) -> None:
     found = await env.add()
-    await feed.refresh_command.callback(env.interaction(), str(found.id))  # type: ignore[arg-type]
+    await feed.refresh_command.callback(env.interaction(), ui.feed_value(found.id))  # type: ignore[arg-type]
     await feed.refresh_command.callback(env.interaction())  # type: ignore[arg-type]
     await feed.RefreshButton(found.id).callback(env.click())  # type: ignore[arg-type]
     await feed.TestButton(found.id).callback(env.click())  # type: ignore[arg-type]
-    await feed.test_command.callback(env.interaction(), str(found.id))  # type: ignore[arg-type]
+    await feed.test_command.callback(env.interaction(), ui.feed_value(found.id))  # type: ignore[arg-type]
     await feed.export_command.callback(env.interaction())  # type: ignore[arg-type]
     await feed.list_command.callback(env.interaction())  # type: ignore[arg-type]
     await feed.PauseFeed(found.id).callback(env.click(user_id=STRANGER))  # type: ignore[arg-type]
@@ -1963,7 +2255,7 @@ async def test_these_messages_ping_nobody(env: Env) -> None:
     assert ui.NO_MENTIONS.to_dict() == {"parse": []}
     sent = [
         (feed.list_command, ()),
-        (feed.history_command, (str(found.id),)),
+        (feed.history_command, (ui.feed_value(found.id),)),
     ]
     for command, args in sent:
         for options in ({}, {"members": (USER,)}):
@@ -2001,7 +2293,7 @@ async def test_history_shows_the_feeds_log_entries_newest_first(env: Env) -> Non
     edit_entry(env, found, 9, changes=[Change("Check interval", "10 minutes", "1 hour")])
     bot_at = pause_by_bot(env, found)
     interaction = env.interaction(**FELLOW)
-    await feed.history_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.history_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
 
     name, sent = interaction.last
     assert name == "send_message" and sent["ephemeral"] is True
@@ -2023,7 +2315,7 @@ async def test_history_has_pages_of_ten_that_keep_the_feed(env: Env) -> None:
     for number in range(1, 25):
         edit_entry(env, found, number, detail=f"number {number}")
     interaction = env.interaction()
-    await feed.history_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.history_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
 
     lines = interaction.text.splitlines()
     assert lines[0] == "**History of Example News**: 25 Log entries"
@@ -2054,7 +2346,7 @@ async def test_history_of_a_feed_without_log_entries(env: Env) -> None:
     found = await env.add()
     env.db._conn.execute("DELETE FROM log_entries")
     interaction = env.interaction()
-    await feed.history_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.history_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert interaction.text == "This Feed has no Log entries yet."
     assert "view" not in interaction.last[1]
 
@@ -2063,7 +2355,7 @@ async def test_history_of_a_removed_feed_is_not_available_by_its_id(env: Env) ->
     found = await env.add()
     await env.service.remove_feed(SERVER, found.id, actor=MEMBER)
     with pytest.raises(ui.UserError, match="That Feed no longer exists"):
-        await feed.history_command.callback(env.interaction(), str(found.id))  # type: ignore[arg-type]
+        await feed.history_command.callback(env.interaction(), ui.feed_value(found.id))  # type: ignore[arg-type]
     click = env.click()
     await feed.HistoryPage(found.id, 0).callback(click)  # type: ignore[arg-type]
     assert click.text == ui.FEED_GONE and click.last[1]["view"] is None
@@ -2073,21 +2365,21 @@ async def test_history_is_for_managers_only(env: Env) -> None:
     found = await env.add()
     stranger = env.interaction(user_id=STRANGER)
     with pytest.raises(ui.UserError, match="Only Managers"):
-        await feed.history_command.callback(stranger, str(found.id))  # type: ignore[arg-type]
+        await feed.history_command.callback(stranger, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert stranger.calls == []
     click = env.click(user_id=STRANGER)
     await feed.HistoryPage(found.id, 0).callback(click)  # type: ignore[arg-type]
     assert click.text == ui.NEED_MANAGER
 
     admin = env.interaction(user_id=OWNER)  # an Admin can do all a Manager can
-    await feed.history_command.callback(admin, str(found.id))  # type: ignore[arg-type]
+    await feed.history_command.callback(admin, ui.feed_value(found.id))  # type: ignore[arg-type]
     assert "added this Feed" in admin.text
 
 
 async def test_history_does_not_show_another_servers_feed(env: Env) -> None:
     foreign = await env.add(server_id=OTHER_SERVER)
     with pytest.raises(ui.UserError, match="That Feed no longer exists"):
-        await feed.history_command.callback(env.interaction(), str(foreign.id))  # type: ignore[arg-type]
+        await feed.history_command.callback(env.interaction(), ui.feed_value(foreign.id))  # type: ignore[arg-type]
     click = env.click()
     await feed.HistoryPage(foreign.id, 0).callback(click)  # type: ignore[arg-type]
     assert click.text == ui.FEED_GONE
@@ -2105,7 +2397,7 @@ async def test_history_does_not_show_another_servers_feed(env: Env) -> None:
         detail="spoof",
     )
     interaction = env.interaction()
-    await feed.history_command.callback(interaction, str(mine.id))  # type: ignore[arg-type]
+    await feed.history_command.callback(interaction, ui.feed_value(mine.id))  # type: ignore[arg-type]
     assert "spoof" not in interaction.text.lower()
 
 
@@ -2121,7 +2413,7 @@ async def test_history_defuses_text_and_fits_the_message(env: Env) -> None:
             changes=[Change("L" * 80, hostile, hostile), Change("Name", "", "")],
         )
     interaction = env.interaction(members=())
-    await feed.history_command.callback(interaction, str(found.id))  # type: ignore[arg-type]
+    await feed.history_command.callback(interaction, ui.feed_value(found.id))  # type: ignore[arg-type]
 
     text = interaction.text
     assert len(text) <= ui.MESSAGE_LIMIT and not text.endswith("…")
